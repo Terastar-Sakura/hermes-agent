@@ -657,9 +657,15 @@ def _decode_audio_file_to_pcm16(path: str, target_rate: int = _FALLBACK_SAMPLE_R
         out = bytearray()
 
         def _emit(frame) -> None:
-            # PyAV 18: resample() returns a LIST of frames (may be empty).
+            # PyAV 18: resample() returns a LIST of frames (may be empty). Use
+            # to_ndarray() (exact sample count) rather than bytes(planes[0]) — the
+            # plane buffer is over-allocated/padded (e.g. 576 samples -> 1216 bytes,
+            # not 1152), so raw plane bytes append ~64-128 garbage bytes PER frame,
+            # heard as periodic scratchiness. Same fix as _ResampledConverseSynth.
             for rs in resampler.resample(frame):
-                out.extend(bytes(rs.planes[0]))
+                data = rs.to_ndarray().tobytes()
+                if data:
+                    out.extend(data)
 
         with av.open(path) as container:
             for frame in container.decode(audio=0):
