@@ -381,10 +381,12 @@ def parse_start_config(frame: Dict[str, Any]) -> Tuple[int, int, float, str, Opt
 # ephemeral system prompt (mirrors the CLI voice mode's brevity prefix), so spoken replies
 # don't balloon to full chat length. When a name is known it also carries wake handling.
 _VOICE_BREVITY_PROMPT = (
-    "You are in a live voice conversation and your reply is spoken aloud. Answer concisely and "
-    "conversationally — at most 2-3 short sentences of plain spoken text, with no code blocks, "
-    "markdown, lists, or URLs. If the request is unclear or you only caught fragments, ask one "
-    "short clarifying question instead of guessing or rambling."
+    "You are in a live, low-latency voice conversation and your reply is spoken aloud. Speed "
+    "matters: answer immediately with your first, most direct response — do not deliberate, "
+    "plan, weigh options, or think out loud before answering. Keep it concise and conversational "
+    "— at most 2-3 short sentences of plain spoken text, with no code blocks, markdown, lists, or "
+    "URLs. If the request is unclear or you only caught fragments, ask one short clarifying "
+    "question instead of guessing or rambling."
 )
 
 
