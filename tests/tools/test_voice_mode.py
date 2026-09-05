@@ -1657,6 +1657,18 @@ class TestBargeDetectorOnset:
         tripped, _ = self._run(150, 0)
         assert tripped is None
 
+    def test_quiet_mic_soft_speech_trips(self):
+        # A low-gain mic: quiet room (floor ~50) and soft speech (~350 RMS). Soft speech is
+        # below the old absolute 400 wall but well above its own floor, so it must trip now
+        # (the "not loud enough -> idle" complaint). Guards ONSET_TRIGGER_MIN staying low.
+        tripped, _ = self._run(50, 350)
+        assert tripped is not None
+
+    def test_quiet_room_low_noise_does_not_false_trip(self):
+        # Same low-gain room, but only quiet noise (below ONSET_TRIGGER_MIN) — must NOT trip.
+        tripped, _ = self._run(50, 250)
+        assert tripped is None
+
     # ── ratchet: speech must not inflate the floor ──
     def test_speech_does_not_ratchet_the_floor(self):
         # Old behavior: sub-trigger speech was absorbed into ambient, climbing the floor to

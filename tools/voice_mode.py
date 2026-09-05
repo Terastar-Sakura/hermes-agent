@@ -1272,6 +1272,17 @@ TRIGGER_CEILING = 4000.0  # a noisy room must never push the trigger past normal
 # leave normal speech (2000-3500) below it. A separate, lower onset ceiling keeps first-word
 # detection sensitive without loosening barge-in bleed rejection (which keeps TRIGGER_CEILING).
 ONSET_TRIGGER_CEILING = 2000.0
+# Absolute floor for the onset (first-word) trigger. The trigger is primarily RELATIVE
+# (quiet_floor * mult); this is only the ground it can't go below, so it must sit just above
+# the SILENCE line (200) — NOT high enough to deafen a quiet/low-gain mic whose speech is soft
+# in absolute terms but still well above its own noise floor. Brief noise is rejected by the
+# sustained trip window (8 of the last 10 blocks), not by a tall absolute wall. (Was 2*SILENCE
+# = 400, which swallowed quiet talkers and reported idle.)
+ONSET_TRIGGER_MIN = SILENCE_RMS_THRESHOLD * 1.5  # 300
+# Smallest value the adaptive quiet floor is clamped to (just avoids a zero/degenerate floor).
+# Deliberately well below SILENCE so a low-gain mic's real room level (~30-80 RMS) is tracked
+# instead of being inflated to 200 — see _BargeDetector._floor.
+MIN_QUIET_FLOOR = 40.0
 DEFAULT_BARGE_MULTIPLIER = 3.0  # over the quiet floor: 300 * 3 = 900 vs 3000+ speech
 
 
@@ -1314,9 +1325,13 @@ class _BargeDetector:
         self.blocks_since_playback = 10_000
 
     def _floor(self) -> tuple:
-        """(pct90, floor): 90th percentile of the quiet window; floor never below the silence threshold."""
-        pct90 = float(self._np.percentile(list(self.ambient), 90)) if self.ambient else float(SILENCE_RMS_THRESHOLD)
-        return pct90, max(pct90, float(SILENCE_RMS_THRESHOLD))
+        """(pct90, floor): 90th percentile of the quiet window, clamped to a small positive
+        ``MIN_QUIET_FLOOR`` (not the silence threshold). Clamping the floor UP to 200 assumed
+        every room's noise sits at ~200 RMS and multiplied the trigger out of reach of a
+        quiet / low-gain mic (whose room floor is genuinely 30-80); the trigger stays safe via
+        ONSET_TRIGGER_MIN + the sustained window, so the floor itself can track the real level."""
+        pct90 = float(self._np.percentile(list(self.ambient), 90)) if self.ambient else float(MIN_QUIET_FLOOR)
+        return pct90, max(pct90, float(MIN_QUIET_FLOOR))
 
     def _calibrate(self, rms: float, playing: bool) -> bool:
         """Lock the floor from the first calib_blocks: the listener arms at utterance
@@ -1353,13 +1368,13 @@ class _BargeDetector:
         # sensitive even when the floor is elevated (AGC pumping), so normal speech still trips.
         ceiling = TRIGGER_CEILING if playing else ONSET_TRIGGER_CEILING
         trigger = max(self.quiet_floor * self.mult,
-                      PLAYBACK_MIN_TRIGGER if playing else float(SILENCE_RMS_THRESHOLD) * 2)
+                      PLAYBACK_MIN_TRIGGER if playing else ONSET_TRIGGER_MIN)
         trigger = min(trigger, ceiling)
         # Track ambient drift ONLY while nothing plays (never absorb bleed) and ONLY for blocks
         # near the quiet estimate. A block well above the floor is speech, not ambient — absorbing
         # it (the old `rms < trigger` gate did, once the trigger pinned at the ceiling) ratchets the
         # floor up toward speech level until the detector goes deaf. Gate the drift below the floor.
-        drift_gate = min(trigger, max(float(SILENCE_RMS_THRESHOLD) * 2, self.quiet_floor * 1.5))
+        drift_gate = min(trigger, max(float(SILENCE_RMS_THRESHOLD), self.quiet_floor * 1.5))
         if not playing and rms < drift_gate:
             self.ambient.append(rms)
             _, self.quiet_floor = self._floor()
