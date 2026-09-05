@@ -40,7 +40,7 @@ def is_whisper_hallucination(transcript: str) -> bool:
             or bool(_HALLUCINATION_REPEAT_RE.match(cleaned)))
 
 
-DEFAULT_VOICE_STOP_PHRASES = ("stop",)
+DEFAULT_VOICE_STOP_PHRASES = ("stop", "cancel")
 
 
 def _load_voice_stop_phrases() -> tuple:

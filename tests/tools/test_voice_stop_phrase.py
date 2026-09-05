@@ -3,7 +3,7 @@
 Contract:
   - `is_voice_stop_phrase` matches ONLY when the whole utterance equals a
     configured phrase (case-insensitive, surrounding punctuation stripped).
-  - Default phrase list is ("stop",); `voice.stop_phrases` in config.yaml
+  - Default phrase list is ("stop", "cancel"); `voice.stop_phrases` in config.yaml
     customizes it; `[]` disables the feature.
   - In the shared continuous loop, a stop phrase halts the loop (like the
     silent-cycle limit) and is NEVER delivered to the agent.
@@ -46,6 +46,26 @@ class TestIsVoiceStopPhrase:
         with patch("tools.voice_mode_transcript._load_voice_stop_phrases", return_value=("halt",)):
             assert is_voice_stop_phrase("halt") is True
             assert is_voice_stop_phrase("stop") is False
+
+
+class TestCancelIsADefaultStopPhrase:
+    """"cancel" ends the exchange by default, alongside "stop"."""
+
+    def test_default_list_is_stop_and_cancel(self):
+        assert DEFAULT_VOICE_STOP_PHRASES == ("stop", "cancel")
+
+    @pytest.mark.parametrize("utterance", [
+        "cancel", "Cancel", "CANCEL", "cancel.", "Cancel!", " cancel ", '"Cancel."', "cancel?",
+    ])
+    def test_cancel_matches(self, utterance):
+        assert is_voice_stop_phrase(utterance, DEFAULT_VOICE_STOP_PHRASES) is True
+
+    def test_stop_still_matches_under_the_default(self):
+        assert is_voice_stop_phrase("stop", DEFAULT_VOICE_STOP_PHRASES) is True
+
+    def test_cancel_inside_a_sentence_is_not_a_stop(self):
+        # Whole-utterance match only: a real request that merely contains "cancel" reaches the agent.
+        assert is_voice_stop_phrase("cancel my 3pm meeting", DEFAULT_VOICE_STOP_PHRASES) is False
 
 
 class TestLoadVoiceStopPhrases:
