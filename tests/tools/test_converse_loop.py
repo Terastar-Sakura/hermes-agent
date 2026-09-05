@@ -302,6 +302,12 @@ class _FakeConverseSession:
     def set_playing(self, value, *, tts_stop=None):
         return None
 
+    def begin_turn(self):
+        self.turns_begun = getattr(self, "turns_begun", 0) + 1
+
+    def end_turn(self):
+        self.turns_ended = getattr(self, "turns_ended", 0) + 1
+
 
 class _EchoSynth:
     sample_rate = 24000
@@ -370,6 +376,15 @@ def test_drive_converse_turns_caps_history_tail():
     assert history[0]["role"] == "user"  # cap preserves whole (user, assistant) pairs here
 
 
+def test_drive_converse_turns_brackets_the_turn_with_begin_end():
+    # The driver must suppress quiet accrual around a turn: begin_turn before running it,
+    # end_turn after turn_done. A stop-word (no turn) must do neither.
+    session = _FakeConverseSession(["hello there."])
+    _run_driver(session, [], ["Hi back."])
+    assert getattr(session, "turns_begun", 0) == 1
+    assert getattr(session, "turns_ended", 0) == 1
+
+
 def test_drive_converse_turns_forwards_quiet_ticks_and_keeps_socket_open():
     # Session mode: the SESSION (not a wall-clock timeout in the driver) emits QuietTick
     # markers as the RECEIVED stream stays silent. The driver forwards each as
@@ -403,6 +418,7 @@ def test_drive_converse_turns_stop_word_ends_exchange(monkeypatch):
     assert types == ["transcript", "stop_word"]
     assert sent[1] == {"type": "stop_word", "text": "goodbye"}
     assert history == []  # the stop phrase never became a turn
+    assert getattr(session, "turns_begun", 0) == 0  # a stop-word does not begin a turn
 
 
 def test_drive_converse_turns_stop_word_ignored_in_continuous_mode(monkeypatch):

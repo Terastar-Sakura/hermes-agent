@@ -195,6 +195,11 @@ class ConverseSession:
         self._quiet_interval = float(quiet_interval)
         self._quiet_seconds = 0.0
         self._next_quiet_at = self._quiet_interval
+        # Set by the driver while a turn is running (STT done → agent thinking → TTS). Quiet is
+        # NOT accrued during a turn: the user has no window to speak into, so counting the
+        # agent's 14-50 s of think/speak time would fire a quiet advisory the instant the reply
+        # ends. Cleared on turn_done, where the quiet clock also restarts from zero.
+        self._turn_active = threading.Event()
         self._stop = threading.Event()
         self._playing = threading.Event()
         # Set by the handler while TTS is streaming so a barge-in can cut it.
@@ -309,8 +314,9 @@ class ConverseSession:
     def _account_received_silence(self) -> None:
         """One 30 ms block of received non-speech audio elapsed. In session mode, accrue it and
         emit an :class:`QuietTick` each time the received silence crosses another quiet_interval —
-        so quiet reflects the user going quiet WHILE streaming, never wall-clock time."""
-        if self._quiet_interval <= 0:
+        so quiet reflects the user going quiet WHILE STREAMING AND FREE TO SPEAK, never wall-clock
+        time and never the agent's think/speak time (suppressed while a turn is active)."""
+        if self._quiet_interval <= 0 or self._turn_active.is_set():
             return
         self._quiet_seconds += self._block / self._input_rate  # == 0.03 s per block
         if self._quiet_seconds + 1e-6 >= self._next_quiet_at:
@@ -321,6 +327,19 @@ class ConverseSession:
         """Speech detected: the quiet clock (and the next quiet threshold) start over."""
         self._quiet_seconds = 0.0
         self._next_quiet_at = self._quiet_interval
+
+    def begin_turn(self) -> None:
+        """Driver hook: a turn is now running (STT done → agent → TTS). Suppress quiet accrual
+        until :meth:`end_turn` — the user has no window to speak into during a reply."""
+        self._turn_active.set()
+        self._reset_quiet()
+
+    def end_turn(self) -> None:
+        """Driver hook: the reply finished (``turn_done``). Resume the quiet clock FROM ZERO, so
+        the first advisory arrives a full quiet_interval after the reply — a real window to
+        follow up before a wake-word client sleeps."""
+        self._turn_active.clear()
+        self._reset_quiet()
 
     def _trigger_barge_in(self) -> None:
         """Cut the in-flight reply: latch the interrupt note and stop TTS."""
@@ -553,6 +572,10 @@ async def drive_converse_turns(
             await send_json({"type": "stop_word", "text": transcript})
             continue
 
+        # Suppress quiet accrual for the whole turn (agent think + speak): the user can't speak
+        # into a reply, so those seconds must not count. end_turn (after turn_done) restarts the
+        # quiet clock from zero so the first advisory lands a full quiet_interval later.
+        session.begin_turn()
         # Clear any stale barge-in latch before this turn; capture it as the per-turn
         # interrupted note so a host that plumbs barge-in parity (the dashboard) can
         # prepend it to the model-bound message.
@@ -696,6 +719,8 @@ async def drive_converse_turns(
         elif turn_result.get("err"):
             await send_json({"type": "error", "error": turn_result["err"]})
         await send_json({"type": "turn_done"})
+        # Reply done: resume the quiet clock from zero (a full quiet_interval window follows).
+        session.end_turn()
 
 
 # ── converse synthesizer: one uniform "text -> int16 PCM" seam for both paths ──

@@ -92,6 +92,30 @@ class TestQuietTracksReceivedSilence:
         assert qs == sorted(qs) and qs[0] > 0, f"quiet_seconds should grow from >0: {qs}"
         assert any(isinstance(e, str) and e for e in events), "speech should end with a transcript"
 
+    def test_quiet_is_suppressed_during_a_turn_and_restarts_from_zero_after(self):
+        # The turn-time bug: while a turn runs (agent think 14-50s + TTS), the client streams
+        # silence it can't speak into. That silence must NOT accrue quiet, and after turn_done
+        # the clock restarts from zero so the first advisory is a full interval away. Exercised
+        # deterministically against the accounting (no worker thread / wall-clock).
+        from tools.voice_converse_loop import ConverseSession, QuietTick
+
+        session = ConverseSession(np, quiet_interval=0.3)  # worker not started
+        session.begin_turn()
+        for _ in range(60):  # ~1.8s of streamed silence DURING the turn
+            session._account_received_silence()
+        assert session.transcripts.empty(), "quiet accrued during a turn (user can't speak then)"
+
+        session.end_turn()  # turn_done → clock restarts from zero
+        for _ in range(12):  # ~0.36s of silence after the reply
+            session._account_received_silence()
+        ticks = []
+        while not session.transcripts.empty():
+            ticks.append(session.transcripts.get_nowait())
+        first = next((t for t in ticks if isinstance(t, QuietTick)), None)
+        assert first is not None, "quiet should accrue again once the turn is over"
+        assert first.quiet_seconds <= 0.35, \
+            f"quiet must restart near 0 after turn_done, not carry turn time: {first.quiet_seconds}"
+
     def test_no_audio_produces_no_quiet_ticks(self):
         # The bug: a session that receives ZERO audio bytes must not accrue quiet time, however
         # long it waits (a held-open socket before the wake word). Feed nothing past a wait that
