@@ -1266,6 +1266,12 @@ def listen_for_speech(
 # speech is 3000-8000; a quiet-room floor is typically 50-300.
 PLAYBACK_MIN_TRIGGER = 1500.0  # min trigger while TTS flows: bleed alone never trips
 TRIGGER_CEILING = 4000.0  # a noisy room must never push the trigger past normal speech
+# The user's FIRST word (no playback → no speaker bleed to reject) must be heard even when
+# the quiet floor is elevated — a browser mic with AGC/noise-suppression pumps the between-word
+# floor up toward 1500-2000, which with floor*mult would pin the trigger at TRIGGER_CEILING and
+# leave normal speech (2000-3500) below it. A separate, lower onset ceiling keeps first-word
+# detection sensitive without loosening barge-in bleed rejection (which keeps TRIGGER_CEILING).
+ONSET_TRIGGER_CEILING = 2000.0
 DEFAULT_BARGE_MULTIPLIER = 3.0  # over the quiet floor: 300 * 3 = 900 vs 3000+ speech
 
 
@@ -1341,12 +1347,20 @@ class _BargeDetector:
         if not self.floor_locked and not self._calibrate(rms, playing):
             return None
         self._track_playback(playing)
-        # Trigger: quiet baseline x multiplier, phase-clamped.
+        # Trigger: quiet baseline x multiplier, phase-clamped. The ceiling is phase-dependent:
+        # during playback TRIGGER_CEILING keeps a noisy room from tripping on bleed; for the
+        # user's first word (not playing) the lower ONSET_TRIGGER_CEILING keeps detection
+        # sensitive even when the floor is elevated (AGC pumping), so normal speech still trips.
+        ceiling = TRIGGER_CEILING if playing else ONSET_TRIGGER_CEILING
         trigger = max(self.quiet_floor * self.mult,
                       PLAYBACK_MIN_TRIGGER if playing else float(SILENCE_RMS_THRESHOLD) * 2)
-        trigger = min(trigger, TRIGGER_CEILING)
-        # Track ambient drift ONLY while nothing plays (never absorb bleed) and the block isn't speech.
-        if not playing and rms < trigger:
+        trigger = min(trigger, ceiling)
+        # Track ambient drift ONLY while nothing plays (never absorb bleed) and ONLY for blocks
+        # near the quiet estimate. A block well above the floor is speech, not ambient — absorbing
+        # it (the old `rms < trigger` gate did, once the trigger pinned at the ceiling) ratchets the
+        # floor up toward speech level until the detector goes deaf. Gate the drift below the floor.
+        drift_gate = min(trigger, max(float(SILENCE_RMS_THRESHOLD) * 2, self.quiet_floor * 1.5))
+        if not playing and rms < drift_gate:
             self.ambient.append(rms)
             _, self.quiet_floor = self._floor()
         above = rms >= trigger
