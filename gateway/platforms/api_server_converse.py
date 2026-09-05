@@ -9,7 +9,7 @@ text frames carry control; barge-in is supported.
 Authentication uses the profile's ``API_SERVER_KEY`` (``_expected_api_key``),
 NOT the dashboard token, and never a ``?token=`` query param. The client's FIRST
 frame is a single ``{"type":"start", ...}`` frame carrying auth + all session
-config (rates, idle_interval, name, profile); the key is presented one of two
+config (rates, quiet_interval, name, profile); the key is presented one of two
 ways (both validated constant-time), so the single handler flow supports both:
 
 (A) Sec-WebSocket-Protocol (browser clients, e.g. Caduceus): the client offers
@@ -38,7 +38,7 @@ adapter.
 
 Protocol:
   client → ``{"type":"start", "key":?, "input_rate":?, "output_rate":?,
-             "idle_interval":?, "name":?, "profile":?}`` (FIRST frame; all but
+             "quiet_interval":?, "name":?, "profile":?}`` (FIRST frame; all but
              auth optional), then binary PCM16 mono frames at ``input_rate``
              (30 ms blocks preferred),
            ``{"stop": true}`` to end, ``{"commit": true}`` to force endpoint
@@ -130,7 +130,8 @@ def _converse_stt_model(self, profile: Optional[str]) -> Optional[str]:
         return stt.get("model")
 
 
-def _resolve_converse_session(self, profile: Optional[str], input_rate: int, output_rate: int):
+def _resolve_converse_session(self, profile: Optional[str], input_rate: int, output_rate: int,
+                              quiet_interval: float = 0.0):
     """Resolve ``(synth, cap, session)`` under the profile scope for the given rates.
 
     Blocking config/provider resolution — runs off the event loop. ``synth`` is a
@@ -150,7 +151,8 @@ def _resolve_converse_session(self, profile: Optional[str], input_rate: int, out
         cfg = _load_tts_config()
         synth = resample_synth(resolve_converse_synthesizer(cfg), output_rate)
         cap = _resolve_max_text_length(_get_provider(cfg), cfg)
-    return synth, cap, ConverseSession(np, stt_model=stt_model, input_rate=input_rate)
+    return synth, cap, ConverseSession(
+        np, stt_model=stt_model, input_rate=input_rate, quiet_interval=quiet_interval)
 
 
 async def _await_start_frame(
@@ -196,7 +198,7 @@ async def _handle_converse_ws(self, request: "web.Request") -> "web.WebSocketRes
     ``hermes-voice-v1`` protocol); (B) if no key subprotocol is offered, the socket
     is accepted and the ``start`` frame's ``key`` authenticates. The client's FIRST
     frame is a single ``{"type":"start", ...}`` carrying auth + all session config
-    (input_rate/output_rate/idle_interval/name/profile). Only after a valid start do
+    (input_rate/output_rate/quiet_interval/name/profile). Only after a valid start do
     we resolve providers and run the client pump + turn driver.
 
     BARGE-IN (v1 limitation): the shared turn driver
@@ -232,14 +234,15 @@ async def _handle_converse_ws(self, request: "web.Request") -> "web.WebSocketRes
     if frame is None:
         return ws
     from tools.voice_converse_loop import parse_start_config
-    input_rate, output_rate, idle_interval, name, start_profile = parse_start_config(frame)
+    input_rate, output_rate, quiet_interval, name, start_profile = parse_start_config(frame)
     # Profile: the start frame wins; else fall back to the request's own scope.
     profile = start_profile if start_profile is not None else _api_request_profile.get()
 
     loop = asyncio.get_running_loop()
     try:
         synth, cap, session = await loop.run_in_executor(
-            None, lambda: _resolve_converse_session(self, profile, input_rate, output_rate))
+            None, lambda: _resolve_converse_session(
+                self, profile, input_rate, output_rate, quiet_interval))
     except Exception:
         logger.exception("converse setup failed")
         with contextlib.suppress(Exception):
@@ -323,7 +326,7 @@ async def _handle_converse_ws(self, request: "web.Request") -> "web.WebSocketRes
             session=session, synth=synth, cap=cap, loop=loop,
             send_json=ws.send_json, send_bytes=ws.send_bytes,
             run_turn=_run_turn, history=conversation_history,
-            idle_interval=idle_interval)
+            quiet_interval=quiet_interval)
 
     pump = asyncio.ensure_future(_pump_client())
     driver = asyncio.ensure_future(_drive_turns())

@@ -536,7 +536,7 @@ async def converse_ws(ws: "WebSocket") -> None:
     """Off-device realtime voice loop: mic PCM in, agent speech out, over one WS.
 
     The client sends a single ``{"type":"start", ...}`` frame first (carrying session
-    config: input_rate/output_rate/idle_interval/name/profile; auth is the pre-accept
+    config: input_rate/output_rate/quiet_interval/name/profile; auth is the pre-accept
     dashboard token, so start.key is not consulted here), then streams PCM16 mono at
     ``input_rate`` as binary frames; the server does VAD → STT → a REAL agent turn
     (``prompt.submit`` in-process, so the spoken conversation persists) → streaming
@@ -575,7 +575,7 @@ async def converse_ws(ws: "WebSocket") -> None:
     await ws.accept()
 
     # The client's FIRST frame is the single {"type":"start", ...} carrying all session
-    # config (rates, idle_interval, name, profile). Dashboard auth is the pre-accept token
+    # config (rates, quiet_interval, name, profile). Dashboard auth is the pre-accept token
     # check above, so start.key is not consulted here — the frame need only be a valid start.
     frame = await _read_converse_start_frame(ws)
     if frame is None:
@@ -586,7 +586,7 @@ async def converse_ws(ws: "WebSocket") -> None:
 
     from tools.voice_converse_loop import parse_start_config
 
-    input_rate, output_rate, idle_interval, name, profile = parse_start_config(frame)
+    input_rate, output_rate, quiet_interval, name, profile = parse_start_config(frame)
     loop = asyncio.get_running_loop()
 
     def _resolve():
@@ -602,7 +602,8 @@ async def converse_ws(ws: "WebSocket") -> None:
             # fallback) — works with any provider, incl. edge — wrapped to emit at output_rate.
             synth = resample_synth(resolve_converse_synthesizer(cfg), output_rate)
             cap = _resolve_max_text_length(_get_provider(cfg), cfg)
-        session = ConverseSession(np, stt_model=stt_model, input_rate=input_rate)
+        session = ConverseSession(
+            np, stt_model=stt_model, input_rate=input_rate, quiet_interval=quiet_interval)
         sid = create_voice_session()
         return synth, cap, session, sid
 
@@ -681,13 +682,13 @@ async def converse_ws(ws: "WebSocket") -> None:
     async def _drive_turns():
         from tools.voice_converse_loop import drive_converse_turns
 
-        # start.idle_interval: session mode — periodic {"type":"idle"} during quiet (socket
+        # start.quiet_interval: session mode — periodic {"type":"quiet"} during quiet (socket
         # stays open) + spoken stop phrases become {"type":"stop_word"}. 0 = continuous.
         await drive_converse_turns(
             session=session, synth=synth, cap=cap, loop=loop,
             send_json=ws.send_json, send_bytes=ws.send_bytes,
             run_turn=_run_turn, history=conversation_history,
-            idle_interval=idle_interval)
+            quiet_interval=quiet_interval)
 
     pump = asyncio.ensure_future(_pump_client())
     driver = asyncio.ensure_future(_drive_turns())

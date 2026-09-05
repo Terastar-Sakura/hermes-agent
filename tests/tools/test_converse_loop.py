@@ -310,7 +310,7 @@ class _EchoSynth:
         yield text.encode("utf-8")
 
 
-def _run_driver(session, history, replies, idle_interval=0.0):
+def _run_driver(session, history, replies, quiet_interval=0.0):
     """Drive drive_converse_turns to completion, returning the JSON frames sent."""
     sent: list = []
 
@@ -332,7 +332,7 @@ def _run_driver(session, history, replies, idle_interval=0.0):
         await drive_converse_turns(
             session=session, synth=_EchoSynth(), cap=4000, loop=loop,
             send_json=_send_json, send_bytes=_send_bytes,
-            run_turn=_run_turn, history=history, idle_interval=idle_interval)
+            run_turn=_run_turn, history=history, quiet_interval=quiet_interval)
 
     asyncio.run(_main())
     return sent
@@ -370,21 +370,22 @@ def test_drive_converse_turns_caps_history_tail():
     assert history[0]["role"] == "user"  # cap preserves whole (user, assistant) pairs here
 
 
-def test_drive_converse_turns_emits_idle_and_keeps_socket_open():
-    # Session mode: no new utterance for a while. The driver emits periodic
-    # {"type":"idle"} with a growing quiet_seconds (it never closes the socket) until a
-    # real frame arrives; here the shutdown sentinel ends the loop after a few intervals.
+def test_drive_converse_turns_forwards_quiet_ticks_and_keeps_socket_open():
+    # Session mode: the SESSION (not a wall-clock timeout in the driver) emits QuietTick
+    # markers as the RECEIVED stream stays silent. The driver forwards each as
+    # {"type":"quiet", quiet_seconds} and never closes the socket, until the shutdown sentinel.
+    from tools.voice_converse_loop import QuietTick
+
     session = _FakeConverseSession([])
-    session.transcripts = _queue.Queue()  # empty; no sentinel yet
-    threading.Timer(0.17, lambda: session.transcripts.put(None)).start()
+    session.transcripts = _queue.Queue()
+    for q in (0.5, 1.0, 1.5):
+        session.transcripts.put(QuietTick(q))
+    session.transcripts.put(None)  # shutdown sentinel ends the loop
 
-    sent = _run_driver(session, [], [], idle_interval=0.05)
+    sent = _run_driver(session, [], [], quiet_interval=0.5)
 
-    idles = [f for f in sent if isinstance(f, dict) and f.get("type") == "idle"]
-    assert len(idles) >= 1
-    quiets = [f["quiet_seconds"] for f in idles]
-    assert all(isinstance(q, (int, float)) for q in quiets)
-    assert quiets == sorted(quiets)  # cumulative quiet grows across pings
+    quiets = [f for f in sent if isinstance(f, dict) and f.get("type") == "quiet"]
+    assert [f["quiet_seconds"] for f in quiets] == [0.5, 1.0, 1.5]  # forwarded verbatim, in order
     assert not any(isinstance(f, dict) and f.get("type") == "turn_done" for f in sent)
 
 
@@ -396,7 +397,7 @@ def test_drive_converse_turns_stop_word_ends_exchange(monkeypatch):
         lambda t: t.strip().lower() == "goodbye")
     session = _FakeConverseSession(["goodbye"])
     history: list = []
-    sent = _run_driver(session, history, ["SHOULD NOT RUN"], idle_interval=1.0)
+    sent = _run_driver(session, history, ["SHOULD NOT RUN"], quiet_interval=1.0)
 
     types = [f.get("type") if isinstance(f, dict) else "bytes" for f in sent]
     assert types == ["transcript", "stop_word"]
@@ -405,12 +406,12 @@ def test_drive_converse_turns_stop_word_ends_exchange(monkeypatch):
 
 
 def test_drive_converse_turns_stop_word_ignored_in_continuous_mode(monkeypatch):
-    # Continuous mode (idle_interval=0): stop-word handling is off — "goodbye" is a
+    # Continuous mode (quiet_interval=0): stop-word handling is off — "goodbye" is a
     # normal turn with no {"type":"stop_word"}.
     monkeypatch.setattr("tools.voice_mode_transcript.is_voice_stop_phrase", lambda t: True)
     session = _FakeConverseSession(["goodbye"])
     history: list = []
-    sent = _run_driver(session, history, ["Bye!"], idle_interval=0.0)
+    sent = _run_driver(session, history, ["Bye!"], quiet_interval=0.0)
 
     types = [f.get("type") if isinstance(f, dict) else "bytes" for f in sent]
     assert "stop_word" not in types

@@ -5,12 +5,14 @@ using audio whose block-RMS envelope mimics real speech across a range of volume
 the regression wall for "I'm talking and the server just reports idle": it fails if the
 detector stops hearing a soft voice, and it fails if it starts hearing silence/room noise.
 """
+import time
+
 import numpy as np
 import pytest
 
 from tests.support.converse_audio import (
     RMS_AT_ROOM_FLOOR, RMS_LOUD_SPEECH, RMS_NORMAL_SPEECH, RMS_QUIET_SPEECH,
-    heard, room_noise, run_utterances, silence, speech_like,
+    collect_session_events, heard, mocked_stt, room_noise, run_utterances, silence, speech_like,
 )
 
 
@@ -69,3 +71,42 @@ class TestBoundaryIsDocumented:
     def test_400_rms_heard_250_noise_silent(self):
         assert heard(speech_like(400, seed=400)), "400 RMS speech should be heard"
         assert not heard(room_noise(250, seed=8), timeout=2.5), "250 RMS noise should be silent"
+
+
+class TestQuietTracksReceivedSilence:
+    """The quiet signal must track silence in the RECEIVED stream, not wall-clock — so a client
+    that holds the socket open and streams only after a wake word never accrues phantom quiet
+    time. Real ConverseSession; STT mocked."""
+
+    def test_streamed_silence_accrues_growing_quiet_then_speech_ends_it(self):
+        from tools.voice_converse_loop import QuietTick
+        # ~2 s of streamed silence (plus the calibration lead-in) at quiet_interval=0.5 →
+        # several quiet ticks with a monotonically growing quiet_seconds, then a real
+        # utterance ends the run with a transcript.
+        events = collect_session_events(
+            [silence(seconds=2.0), speech_like(RMS_NORMAL_SPEECH, seed=5), silence(seconds=1.5)],
+            quiet_interval=0.5)
+        ticks = [e for e in events if isinstance(e, QuietTick)]
+        assert len(ticks) >= 2, f"expected quiet ticks from streamed silence, got {events!r}"
+        qs = [t.quiet_seconds for t in ticks]
+        assert qs == sorted(qs) and qs[0] > 0, f"quiet_seconds should grow from >0: {qs}"
+        assert any(isinstance(e, str) and e for e in events), "speech should end with a transcript"
+
+    def test_no_audio_produces_no_quiet_ticks(self):
+        # The bug: a session that receives ZERO audio bytes must not accrue quiet time, however
+        # long it waits (a held-open socket before the wake word). Feed nothing past a wait that
+        # is several quiet_intervals long, and confirm the queue never gets a QuietTick.
+        from tools.voice_converse_loop import ConverseSession, QuietTick
+
+        with mocked_stt("unused"):
+            session = ConverseSession(np, quiet_interval=0.3)
+            session.start()
+            try:
+                time.sleep(1.6)  # >5 intervals of pure wall-clock, but no audio is fed
+                drained = []
+                while not session.transcripts.empty():
+                    drained.append(session.transcripts.get_nowait())
+                assert not any(isinstance(x, QuietTick) for x in drained), \
+                    f"quiet ticks fired without any received audio: {drained!r}"
+            finally:
+                session.stop()

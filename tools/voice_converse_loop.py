@@ -149,6 +149,18 @@ class _NetworkMicStream:
                 self._carry = self._np.concatenate([self._carry, chunk])
 
 
+class QuietTick:
+    """A session-mode quiet marker the VAD worker puts on the transcripts queue when the
+    RECEIVED audio stream has been silent for another ``quiet_interval``. ``quiet_seconds`` is
+    the cumulative received-silence since the last speech. Distinct type so the turn driver
+    tells it apart from a transcript (a ``str``) and the shutdown sentinel (``None``)."""
+
+    __slots__ = ("quiet_seconds",)
+
+    def __init__(self, quiet_seconds: float) -> None:
+        self.quiet_seconds = quiet_seconds
+
+
 class ConverseSession:
     """Drives the reused VAD → STT loop against a :class:`_NetworkMicStream`.
 
@@ -164,6 +176,7 @@ class ConverseSession:
     def __init__(
         self, np: Any, *, stt_model: Optional[str] = None,
         barge_multiplier: Optional[float] = None, input_rate: int = 16000,
+        quiet_interval: float = 0.0,
     ) -> None:
         from tools import voice_mode as _vm
 
@@ -174,6 +187,14 @@ class ConverseSession:
         # capture WAV is written at the rate the client actually sends; Whisper resamples
         # internally, so STT works at any rate. Block size is 30 ms worth of samples at it.
         self._input_rate = int(input_rate)
+        # Session mode: quiet is measured in RECEIVED-audio silence, NOT wall clock. Each
+        # non-speech block the worker reads is 30 ms of audio the client actually sent; when
+        # no audio arrives the worker parks in stream.read() and this clock does not advance,
+        # so a client holding the socket open (streaming only after a wake word) never
+        # accrues phantom quiet time. Reset to 0 on speech. 0 = continuous (no quiet ticks).
+        self._quiet_interval = float(quiet_interval)
+        self._quiet_seconds = 0.0
+        self._next_quiet_at = self._quiet_interval
         self._stop = threading.Event()
         self._playing = threading.Event()
         # Set by the handler while TTS is streaming so a barge-in can cut it.
@@ -261,7 +282,14 @@ class ConverseSession:
                 playing = self.playing()
                 phase = self._detector.feed(vm._rms(np, data), playing)
                 if phase is None:
+                    # A block of received audio with no speech onset: 30 ms of real,
+                    # client-sent silence. This is the ONLY place quiet time accrues, and it
+                    # only runs when stream.read() actually returned a block — so a client
+                    # that sends nothing never accrues quiet.
+                    self._account_received_silence()
                     continue
+                # Speech: the user is talking, so the quiet clock resets.
+                self._reset_quiet()
                 # Barge-in: a trip during playback cuts the reply mid-stream.
                 if playing:
                     self._trigger_barge_in()
@@ -277,6 +305,22 @@ class ConverseSession:
             _log.warning("converse VAD loop failed", exc_info=True)
         finally:
             self.transcripts.put(None)
+
+    def _account_received_silence(self) -> None:
+        """One 30 ms block of received non-speech audio elapsed. In session mode, accrue it and
+        emit an :class:`QuietTick` each time the received silence crosses another quiet_interval —
+        so quiet reflects the user going quiet WHILE streaming, never wall-clock time."""
+        if self._quiet_interval <= 0:
+            return
+        self._quiet_seconds += self._block / self._input_rate  # == 0.03 s per block
+        if self._quiet_seconds + 1e-6 >= self._next_quiet_at:
+            self.transcripts.put(QuietTick(round(self._quiet_seconds, 1)))
+            self._next_quiet_at += self._quiet_interval
+
+    def _reset_quiet(self) -> None:
+        """Speech detected: the quiet clock (and the next quiet threshold) start over."""
+        self._quiet_seconds = 0.0
+        self._next_quiet_at = self._quiet_interval
 
     def _trigger_barge_in(self) -> None:
         """Cut the in-flight reply: latch the interrupt note and stop TTS."""
@@ -343,7 +387,7 @@ def split_text_for_tts_stream(text: str, cap: int) -> list:
 _HISTORY_MAX_MESSAGES = 40
 
 
-_IDLE_INTERVAL_MAX = 3600.0
+_QUIET_INTERVAL_MAX = 3600.0
 
 # Per-connection sample-rate defaults + clamp range. A single-clock device (ESP32) can set
 # input_rate == output_rate; browsers keep the 16 kHz-in / 24 kHz-out split. Rates outside
@@ -368,20 +412,20 @@ DEFAULT_CONVERSE_NAME = "Sakura"
 
 
 def parse_start_config(frame: Dict[str, Any]) -> Tuple[int, int, float, str, Optional[str]]:
-    """Resolve ``(input_rate, output_rate, idle_interval, name, profile)`` from a ``start`` frame.
+    """Resolve ``(input_rate, output_rate, quiet_interval, name, profile)`` from a ``start`` frame.
 
-    All fields optional; defaults: input_rate=16000, output_rate=24000, idle_interval=0
+    All fields optional; defaults: input_rate=16000, output_rate=24000, quiet_interval=0
     (continuous), name="Sakura", profile=None. Rates are clamped to [8000, 48000] and
-    idle_interval via :func:`parse_idle_interval`. Shared by both WS hosts.
+    quiet_interval via :func:`parse_quiet_interval`. Shared by both WS hosts.
     """
     input_rate = clamp_sample_rate(frame.get("input_rate"), DEFAULT_INPUT_RATE)
     output_rate = clamp_sample_rate(frame.get("output_rate"), DEFAULT_OUTPUT_RATE)
-    idle_interval = parse_idle_interval(frame.get("idle_interval"))
+    quiet_interval = parse_quiet_interval(frame.get("quiet_interval"))
     raw_name = frame.get("name")
     name = str(raw_name).strip() if raw_name is not None and str(raw_name).strip() \
         else DEFAULT_CONVERSE_NAME
     profile = frame.get("profile") or None
-    return input_rate, output_rate, idle_interval, name, profile
+    return input_rate, output_rate, quiet_interval, name, profile
 
 
 # Voice replies are spoken aloud — keep them short and speakable. Built per-turn as the
@@ -419,13 +463,13 @@ def voice_system_prompt(name: Optional[str] = None) -> str:
 _MAX_TTS_CHARS_PER_TURN = 1500
 
 
-def parse_idle_interval(raw: Any) -> float:
-    """Clamp an ``idle_interval`` VALUE (from the ``start`` frame) → seconds of quiet between
-    turns before an ``{"type":"idle"}`` notification (which also enables stop-phrase →
+def parse_quiet_interval(raw: Any) -> float:
+    """Clamp an ``quiet_interval`` VALUE (from the ``start`` frame) → seconds of quiet between
+    turns before an ``{"type":"quiet"}`` notification (which also enables stop-phrase →
     ``{"type":"stop_word"}``). Accepts a number, numeric string, or ``None``.
 
     This is the SESSION-mode opt-in. Absent / invalid / ``<= 0`` → ``0.0`` = continuous mode:
-    no idle pings and no stop-word handling — the original always-listening behavior, so
+    no quiet pings and no stop-word handling — the original always-listening behavior, so
     existing clients are unaffected. A positive value enables session mode (clamped to a sane
     max); a wake-word client passes e.g. ``15``."""
     if raw is None:
@@ -434,7 +478,7 @@ def parse_idle_interval(raw: Any) -> float:
         val = float(raw)
     except (TypeError, ValueError):
         return 0.0
-    return 0.0 if val <= 0 else min(val, _IDLE_INTERVAL_MAX)
+    return 0.0 if val <= 0 else min(val, _QUIET_INTERVAL_MAX)
 
 
 async def drive_converse_turns(
@@ -447,7 +491,7 @@ async def drive_converse_turns(
     send_bytes: Callable[[bytes], Awaitable[Any]],
     run_turn: Callable[..., Awaitable[Tuple[str, Optional[str]]]],
     history: List[Dict[str, str]],
-    idle_interval: float = 0.0,
+    quiet_interval: float = 0.0,
 ) -> None:
     """Run the per-transcript incremental-TTS turn loop shared by both WS hosts.
 
@@ -486,32 +530,26 @@ async def drive_converse_turns(
     from tools.tts_text_normalize import _strip_markdown_for_tts
     from tools.voice_mode_transcript import is_voice_stop_phrase
 
-    quiet = 0.0  # seconds of no NEW utterance while waiting between turns (session mode)
     while not session.stopped:
-        if idle_interval > 0:
-            # Session mode (wake-word clients). Timed wait for the next utterance; on a
-            # quiet interval, notify the client and KEEP the socket open (streaming
-            # continues) — a periodic {"type":"idle"} hint a wake-word client uses to
-            # re-arm/sleep, and a continuous client ignores. Repeats every idle_interval
-            # of quiet; `quiet_seconds` is the cumulative quiet since the last utterance.
-            try:
-                transcript = await loop.run_in_executor(
-                    None, lambda: session.transcripts.get(timeout=idle_interval))
-            except queue.Empty:
-                quiet = round(quiet + idle_interval, 1)
-                await send_json({"type": "idle", "quiet_seconds": quiet})
-                continue
-        else:
-            transcript = await loop.run_in_executor(None, session.transcripts.get)
-        if transcript is None:  # shutdown sentinel
+        # Block for the next event on the session queue: a transcript (str), an QuietTick
+        # (session mode — the RECEIVED stream stayed silent for another quiet_interval; the
+        # socket stays open, a wake-word client uses this to re-arm/sleep), or None (shutdown).
+        # Quiet is stream-driven in the session (see ConverseSession._account_received_silence),
+        # NOT a wall-clock timeout here — a client holding the socket open without streaming
+        # never gets a quiet ping.
+        item = await loop.run_in_executor(None, session.transcripts.get)
+        if item is None:  # shutdown sentinel
             break
+        if isinstance(item, QuietTick):
+            await send_json({"type": "quiet", "quiet_seconds": item.quiet_seconds})
+            continue
+        transcript = item
         if not transcript:
             continue
-        quiet = 0.0  # a real utterance resets the quiet clock
         await send_json({"type": "transcript", "text": transcript})
         # Session mode: a spoken stop phrase ("goodbye"/"stop"/…) ends the exchange —
         # tell the client and skip the agent turn (the client decides to re-arm/sleep).
-        if idle_interval > 0 and is_voice_stop_phrase(transcript):
+        if quiet_interval > 0 and is_voice_stop_phrase(transcript):
             await send_json({"type": "stop_word", "text": transcript})
             continue
 

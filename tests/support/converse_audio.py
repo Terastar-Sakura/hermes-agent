@@ -124,3 +124,37 @@ def run_utterances(pcm_segments: List[np.ndarray], *, transcript: str = "heard",
 def heard(pcm: np.ndarray, **kw) -> bool:
     """True iff the real session produced at least one transcript for *pcm*."""
     return len(run_utterances([pcm], **kw)) >= 1
+
+
+def collect_session_events(pcm_segments: List[np.ndarray], *, quiet_interval: float,
+                           input_rate: int = SAMPLE_RATE, max_wait: float = 8.0) -> list:
+    """Drive a real ConverseSession in session mode and return the ordered events it produced —
+    str transcripts and QuietTick objects. Stops at the first non-empty transcript (a natural
+    end marker) or after *max_wait*. Lets tests assert the received-silence quiet accounting."""
+    import queue as _queue
+    import time
+
+    from tools.voice_converse_loop import ConverseSession
+
+    events: list = []
+    with mocked_stt("heard"):
+        session = ConverseSession(np, input_rate=input_rate, quiet_interval=quiet_interval)
+        session.start()
+        try:
+            session.stream.feed(calibration().tobytes())
+            for seg in pcm_segments:
+                session.stream.feed(seg.tobytes())
+            deadline = time.monotonic() + max_wait
+            while time.monotonic() < deadline:
+                try:
+                    item = session.transcripts.get(timeout=0.5)
+                except _queue.Empty:
+                    continue
+                if item is None:
+                    break
+                events.append(item)
+                if isinstance(item, str) and item:
+                    break  # a real utterance — natural end of collection
+        finally:
+            session.stop()
+    return events

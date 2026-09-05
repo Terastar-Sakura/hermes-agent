@@ -661,10 +661,10 @@ async def test_loud_tone_but_never_bare_silence_or_noise(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_socket_stays_open_across_idle_then_takes_a_turn(monkeypatch):
-    """Session mode: after a quiet stretch the server sends {"type":"idle"} but NEVER closes the
-    socket — a following utterance still runs a turn on the SAME connection (the client keeps
-    the socket open the entire time)."""
+async def test_socket_stays_open_across_quiet_then_takes_a_turn(monkeypatch):
+    """Session mode: after a quiet stretch OF STREAMED AUDIO the server sends {"type":"quiet"}
+    but NEVER closes the socket — a following utterance still runs a turn on the SAME
+    connection (the client keeps the socket open the entire time)."""
     adapter = _adapter()
     streamer = _FakeStreamer([b"\x01\x02"])
     _patch_converse(monkeypatch, streamer, transcript="still here")
@@ -673,23 +673,23 @@ async def test_socket_stays_open_across_idle_then_takes_a_turn(monkeypatch):
     async with TestClient(TestServer(_app(adapter))) as client:
         ws = await client.ws_connect("/v1/audio/converse", protocols=(VOICE_PROTOCOL, _key_protocol()))
         try:
-            await ws.send_str(_start_msg(idle_interval=1))
+            await ws.send_str(_start_msg(quiet_interval=1))
             assert json.loads((await _recv(ws)).data)["type"] == "ready"
             for f in _calibration_frames(blocks=30):
                 await ws.send_bytes(f)
             for f in _pcm_frames(_silence_pcm(seconds=2.5)):
                 await ws.send_bytes(f)
 
-            saw_idle = False
+            saw_quiet = False
             for _ in range(300):
                 msg = await _recv(ws, timeout=6.0)
-                if msg.type == web.WSMsgType.TEXT and json.loads(msg.data).get("type") == "idle":
-                    saw_idle = True
+                if msg.type == web.WSMsgType.TEXT and json.loads(msg.data).get("type") == "quiet":
+                    saw_quiet = True
                     break
                 if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED, web.WSMsgType.ERROR):
                     break
-            assert saw_idle, "expected an idle advisory during the quiet stretch"
-            assert not ws.closed, "socket must stay open across idle — the server never closes it"
+            assert saw_quiet, "expected a quiet advisory during the streamed-silence stretch"
+            assert not ws.closed, "socket must stay open across quiet — the server never closes it"
 
             # Speak now → a real turn on the SAME still-open socket.
             for f in _pcm_frames(speech_like(RMS_NORMAL_SPEECH, seed=9)):
@@ -708,6 +708,34 @@ async def test_socket_stays_open_across_idle_then_takes_a_turn(monkeypatch):
                 elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED, web.WSMsgType.ERROR):
                     break
             assert got == "still here", f"turn after idle failed on the same socket: {got!r}"
+        finally:
+            await ws.send_str(json.dumps({"stop": True}))
+            await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_no_audio_sent_yields_no_quiet_ping(monkeypatch):
+    """Regression for the idle/quiet bug: a client that negotiates and HOLDS the socket open
+    without streaming audio must not accrue quiet time — quiet counts silence in the RECEIVED
+    stream, not wall-clock since connect. With quiet_interval=1 and no audio sent, no
+    {"type":"quiet"} may arrive (else a wake-word client wakes to a bogus multi-second ping)."""
+    adapter = _adapter()
+    streamer = _FakeStreamer([b"\x01"])
+    _patch_converse(monkeypatch, streamer, transcript="unused")
+    _patch_run_agent(adapter, monkeypatch)
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        ws = await client.ws_connect("/v1/audio/converse", protocols=(VOICE_PROTOCOL, _key_protocol()))
+        try:
+            await ws.send_str(_start_msg(quiet_interval=1))
+            assert json.loads((await _recv(ws)).data)["type"] == "ready"
+            # Send NOTHING for >2 intervals. The server must stay silent → the receive times out.
+            with pytest.raises(asyncio.TimeoutError):
+                msg = await _recv(ws, timeout=2.5)
+                assert not (
+                    msg.type == web.WSMsgType.TEXT and json.loads(msg.data).get("type") == "quiet"
+                ), "server sent a quiet ping despite the client streaming no audio"
+            assert not ws.closed, "socket must stay open while idle-but-silent"
         finally:
             await ws.send_str(json.dumps({"stop": True}))
             await ws.close()
