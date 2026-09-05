@@ -620,7 +620,7 @@ async def drive_converse_turns(
         # number the user hears as "lag before it starts talking".
         def _ms(k):
             return f"{(_timing[k]-_t0)*1000:.0f}ms" if k in _timing else "—"
-        _log.warning(
+        _log.info(
             "converse timing: first_delta=%s first_sentence=%s first_pcm=%s total=%s "
             "deltas=%d reply_chars=%d",
             _ms("first_delta"), _ms("first_sentence"), _ms("first_pcm"),
