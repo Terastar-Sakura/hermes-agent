@@ -16,6 +16,7 @@ turn_done); (2) first-message auth accept runs a full turn; (3) neither provided
 with 401; a bad/absent first-message auth closes 4401).
 """
 
+import asyncio
 import json
 import wave
 
@@ -26,6 +27,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+from tests.support.converse_audio import (
+    RMS_NORMAL_SPEECH, RMS_QUIET_SPEECH, room_noise, silence as _silence_pcm, speech_like,
+)
 
 
 API_KEY = "-".join(("fixture", "converse", "api", "key", "0123456789"))
@@ -549,6 +553,161 @@ async def test_equal_input_output_rates_reported_and_full_turn(monkeypatch):
                     break
             assert got_transcript == "turn it on"
             assert pcm == [b"\x01\x02\x03\x04", b"\x05\x06"]  # no-op resample: bytes unchanged
+        finally:
+            await ws.send_str(json.dumps({"stop": True}))
+            await ws.close()
+
+
+# ── realistic-audio, socket-lifetime coverage ────────────────────────────────
+# The tests above use a loud constant tone to trip the VAD. These prove the REAL VAD hears a
+# SOFT voice through the whole gateway stack, and that the socket stays open the entire time.
+
+def _pcm_frames(arr, block=480):
+    return [arr[i:i + block].tobytes() for i in range(0, len(arr) - 1, block)]
+
+
+def _calibration_frames(block=480, blocks=40):
+    rng = np.random.default_rng(7)
+    calib = (rng.standard_normal(block * blocks) * 50).clip(-32000, 32000).astype(np.int16)
+    return _pcm_frames(calib, block)
+
+
+async def _recv(ws, timeout=6.0):
+    return await asyncio.wait_for(ws.receive(), timeout)
+
+
+@pytest.mark.asyncio
+async def test_quiet_speech_full_turn_over_ws(monkeypatch):
+    """A SOFT voice (~500 RMS realistic envelope), NOT a loud tone, is heard end-to-end through
+    the gateway: real VAD + endpointer + capture → transcript + reply PCM + turn_done."""
+    adapter = _adapter()
+    streamer = _FakeStreamer([b"\x01\x02\x03\x04"])
+    _patch_converse(monkeypatch, streamer, transcript="quiet please")
+    _patch_run_agent(adapter, monkeypatch)
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        ws = await client.ws_connect("/v1/audio/converse", protocols=(VOICE_PROTOCOL, _key_protocol()))
+        try:
+            await ws.send_str(_start_msg())
+            ready = await _recv(ws)
+            assert json.loads(ready.data)["type"] == "ready"
+            for f in _calibration_frames():
+                await ws.send_bytes(f)
+            for f in _pcm_frames(speech_like(RMS_QUIET_SPEECH, seed=500)):
+                await ws.send_bytes(f)
+            for f in _pcm_frames(_silence_pcm(seconds=1.7)):
+                await ws.send_bytes(f)
+
+            got, pcm = None, []
+            while True:
+                msg = await _recv(ws, timeout=8.0)
+                if msg.type == web.WSMsgType.BINARY:
+                    pcm.append(msg.data)
+                    continue
+                if msg.type == web.WSMsgType.TEXT:
+                    payload = json.loads(msg.data)
+                    if payload["type"] == "transcript":
+                        got = payload["text"]
+                    elif payload["type"] == "turn_done":
+                        break
+                    continue
+                break
+            assert got == "quiet please", f"soft voice was not heard: {got!r}"
+            assert pcm, "no reply audio flowed for the soft-voice turn"
+        finally:
+            await ws.send_str(json.dumps({"stop": True}))
+            await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_loud_tone_but_never_bare_silence_or_noise(monkeypatch):
+    """Guard the other direction over the WS: a quiet stretch of room noise before any speech
+    does not produce a phantom transcript — only the real utterance does."""
+    adapter = _adapter()
+    streamer = _FakeStreamer([b"\x09\x09"])
+    _patch_converse(monkeypatch, streamer, transcript="the real one")
+    _patch_run_agent(adapter, monkeypatch)
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        ws = await client.ws_connect("/v1/audio/converse", protocols=(VOICE_PROTOCOL, _key_protocol()))
+        try:
+            await ws.send_str(_start_msg())
+            assert json.loads((await _recv(ws)).data)["type"] == "ready"
+            for f in _calibration_frames():
+                await ws.send_bytes(f)
+            for f in _pcm_frames(room_noise(200, seconds=1.5, seed=13)):  # must NOT trip
+                await ws.send_bytes(f)
+            for f in _pcm_frames(speech_like(RMS_NORMAL_SPEECH, seed=1)):
+                await ws.send_bytes(f)
+            for f in _pcm_frames(_silence_pcm(seconds=1.7)):
+                await ws.send_bytes(f)
+
+            transcripts = []
+            while True:
+                msg = await _recv(ws, timeout=8.0)
+                if msg.type == web.WSMsgType.TEXT:
+                    payload = json.loads(msg.data)
+                    if payload["type"] == "transcript":
+                        transcripts.append(payload["text"])
+                    elif payload["type"] == "turn_done":
+                        break
+                    continue
+                if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED, web.WSMsgType.ERROR):
+                    break
+            assert transcripts == ["the real one"], f"room noise leaked a phantom turn: {transcripts}"
+        finally:
+            await ws.send_str(json.dumps({"stop": True}))
+            await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_socket_stays_open_across_idle_then_takes_a_turn(monkeypatch):
+    """Session mode: after a quiet stretch the server sends {"type":"idle"} but NEVER closes the
+    socket — a following utterance still runs a turn on the SAME connection (the client keeps
+    the socket open the entire time)."""
+    adapter = _adapter()
+    streamer = _FakeStreamer([b"\x01\x02"])
+    _patch_converse(monkeypatch, streamer, transcript="still here")
+    _patch_run_agent(adapter, monkeypatch)
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        ws = await client.ws_connect("/v1/audio/converse", protocols=(VOICE_PROTOCOL, _key_protocol()))
+        try:
+            await ws.send_str(_start_msg(idle_interval=1))
+            assert json.loads((await _recv(ws)).data)["type"] == "ready"
+            for f in _calibration_frames(blocks=30):
+                await ws.send_bytes(f)
+            for f in _pcm_frames(_silence_pcm(seconds=2.5)):
+                await ws.send_bytes(f)
+
+            saw_idle = False
+            for _ in range(300):
+                msg = await _recv(ws, timeout=6.0)
+                if msg.type == web.WSMsgType.TEXT and json.loads(msg.data).get("type") == "idle":
+                    saw_idle = True
+                    break
+                if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED, web.WSMsgType.ERROR):
+                    break
+            assert saw_idle, "expected an idle advisory during the quiet stretch"
+            assert not ws.closed, "socket must stay open across idle — the server never closes it"
+
+            # Speak now → a real turn on the SAME still-open socket.
+            for f in _pcm_frames(speech_like(RMS_NORMAL_SPEECH, seed=9)):
+                await ws.send_bytes(f)
+            for f in _pcm_frames(_silence_pcm(seconds=1.7)):
+                await ws.send_bytes(f)
+            got = None
+            for _ in range(600):
+                msg = await _recv(ws, timeout=8.0)
+                if msg.type == web.WSMsgType.TEXT:
+                    payload = json.loads(msg.data)
+                    if payload.get("type") == "transcript":
+                        got = payload["text"]
+                    elif payload.get("type") == "turn_done":
+                        break
+                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED, web.WSMsgType.ERROR):
+                    break
+            assert got == "still here", f"turn after idle failed on the same socket: {got!r}"
         finally:
             await ws.send_str(json.dumps({"stop": True}))
             await ws.close()

@@ -1314,9 +1314,16 @@ def _capture_until_quiet(stream, np, block: int, pre_roll, *, endpoint_blocks: i
 class _BargeDetector:
     """Per-block barge-in state machine behind ``full_duplex_listen``."""
 
-    def __init__(self, np, *, mult: float, calib_blocks: int, trip_blocks: int, grace_blocks: int) -> None:
+    def __init__(self, np, *, mult: float, calib_blocks: int, trip_blocks: int, grace_blocks: int,
+                 trip_fraction: float = 0.8) -> None:
         self._np, self.mult, self.calib_blocks, self.grace_blocks = np, mult, calib_blocks, grace_blocks
-        self.trip_needed = max(1, int(round(trip_blocks * 0.8)))
+        # Fraction of the recent window that must be above the trigger to trip. 0.8 (the CLI
+        # barge default) demands a very sustained run, which quiet/choppy speech — whose
+        # inter-syllable dips fall below the trigger — can't meet, so it goes unheard. A lower
+        # fraction (the converse loop passes 0.6) hears softer speech; noise rejection is
+        # unchanged (sustained room noise trips at 0.8 too — it's the trigger + floor that
+        # gate noise, not the window length).
+        self.trip_needed = max(1, int(round(trip_blocks * trip_fraction)))
         self.ambient: deque = deque(maxlen=100)  # ~3s of quiet-phase RMS
         self.recent_above: deque = deque(maxlen=trip_blocks)
         self.quiet_floor = float(SILENCE_RMS_THRESHOLD)

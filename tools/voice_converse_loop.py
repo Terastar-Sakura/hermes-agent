@@ -50,6 +50,9 @@ _FALLBACK_PCM_CHUNK_BYTES = 32 * 1024
 # 30 ms blocks = 480 frames.  These knobs mirror full_duplex_listen's defaults so the
 # network loop behaves identically to the local mic loop.
 _SUSTAINED_MS = 300
+# Fraction of the sustained window that must be above the trigger to count as speech onset.
+# Lower than the CLI barge default (0.8) so soft speech with inter-syllable dips is still heard.
+_CONVERSE_TRIP_FRACTION = 0.6
 _CALIBRATION_MS = 450
 _GRACE_MS = 500
 _PRE_ROLL_MS = 1200
@@ -187,6 +190,10 @@ class ConverseSession:
             calib_blocks=max(1, _CALIBRATION_MS // 30),
             trip_blocks=max(1, _SUSTAINED_MS // 30),
             grace_blocks=max(0, _GRACE_MS // 30),
+            # Hear quiet/soft speech: a 0.6 window (vs the 0.8 CLI barge default) tolerates the
+            # inter-syllable dips of soft speech, lowering the reliably-heard level to ~400-500
+            # RMS without loosening noise rejection (the floor + trigger gate noise).
+            trip_fraction=_CONVERSE_TRIP_FRACTION,
         )
         from collections import deque
 
