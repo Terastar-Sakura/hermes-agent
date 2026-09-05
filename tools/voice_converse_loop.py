@@ -31,6 +31,7 @@ import json
 import logging
 import queue
 import threading
+import time
 from typing import (
     Any, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple)
 
@@ -514,11 +515,16 @@ async def drive_converse_turns(
         tts_stop = threading.Event()
         reply_parts: List[str] = []
         turn_result: dict = {}
+        # Latency breakdown (transcript -> reply). Populated as the turn runs; logged at
+        # turn end. `_t0` is set the instant STT finished (the transcript frame just went out).
+        _t0 = time.monotonic()
+        _timing: dict = {}
 
         def _on_delta(delta: str) -> None:
             # Called from run_turn's execution context (main-loop coroutine or a
             # worker thread); text_q is thread-safe either way.
             if delta:
+                _timing.setdefault("first_delta", time.monotonic())
                 reply_parts.append(delta)
                 text_q.put(delta)
 
@@ -569,10 +575,12 @@ async def drive_converse_turns(
                     cleaned = _strip_markdown_for_tts(sentence)
                     if not cleaned:
                         continue
+                    _timing.setdefault("first_sentence", time.monotonic())
                     for piece in split_text_for_tts_stream(cleaned, cap):
                         for chunk in synth.synth(piece):
                             if tts_stop.is_set() or session.stopped:
                                 return
+                            _timing.setdefault("first_pcm", time.monotonic())
                             loop.call_soon_threadsafe(pcm_q.put_nowait, chunk)
                     spoken_chars += len(cleaned)
                     if spoken_chars >= _MAX_TTS_CHARS_PER_TURN:
@@ -603,6 +611,19 @@ async def drive_converse_turns(
             await send_bytes(chunk)
         if speaking:
             session.set_playing(False)
+
+        # Latency breakdown, relative to STT completion (transcript out). first_delta =
+        # LLM time-to-first-token; first_sentence-first_delta = generation until a full
+        # sentence; first_pcm-first_sentence = TTS synth of that sentence; first_pcm = the
+        # number the user hears as "lag before it starts talking".
+        def _ms(k):
+            return f"{(_timing[k]-_t0)*1000:.0f}ms" if k in _timing else "—"
+        _log.info(
+            "converse timing: first_delta=%s first_sentence=%s first_pcm=%s total=%s "
+            "deltas=%d reply_chars=%d",
+            _ms("first_delta"), _ms("first_sentence"), _ms("first_pcm"),
+            f"{(time.monotonic()-_t0)*1000:.0f}ms", len(reply_parts),
+            sum(len(p) for p in reply_parts))
 
         # The turn task set the None sentinel that ended synthesis, so it is
         # effectively done; await it to surface errors and settle turn_result.
