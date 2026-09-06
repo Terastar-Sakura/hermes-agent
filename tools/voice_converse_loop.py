@@ -66,8 +66,13 @@ _CONVERSE_ENDPOINT_FLOOR_MULT = 1.3
 _CALIBRATION_MS = 450
 _GRACE_MS = 500
 _PRE_ROLL_MS = 1200
-_ENDPOINT_SILENCE_MS = 1250
-_MAX_UTTERANCE_MS = 30_000
+# How long speech must stay un-sustained before the utterance ends. This is the bulk of the
+# "listening" tail the user waits through AFTER they stop talking, so keep it short (a snappy
+# endpoint) — 700 ms is enough to ride over a normal between-word pause without feeling laggy.
+_ENDPOINT_SILENCE_MS = 700
+# Hard cap on one capture. With the sustained endpoint a noisy room ends normally, but bound the
+# pathological case so "listening" can never run to half a minute.
+_MAX_UTTERANCE_MS = 12_000
 
 
 class _NetworkMicStream:
@@ -375,8 +380,8 @@ class ConverseSession:
         vm, np = self._vm, self._np
         # End the utterance when the level falls back toward the ambient floor, not below an
         # absolute 200 — so with a TV on (floor ~1500) the utterance closes when the USER stops
-        # instead of running to the 30 s cap and gluing the reply to the TV. Quiet rooms
-        # (floor ~50) keep the 200 threshold via max().
+        # instead of running to the max cap. Quiet rooms (floor ~50) keep the 200 threshold via
+        # max(). The short endpoint window (_ENDPOINT_SILENCE_MS) keeps the "listening" tail snappy.
         silence_rms = max(float(vm.SILENCE_RMS_THRESHOLD),
                           self._detector.quiet_floor * _CONVERSE_ENDPOINT_FLOOR_MULT)
         wav_path = vm._capture_until_quiet(
