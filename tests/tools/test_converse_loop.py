@@ -349,11 +349,11 @@ def test_drive_converse_turns_control_frame_ordering():
     history: list = []
     sent = _run_driver(session, history, ["Hi back."])
 
-    # transcript -> speaking -> PCM bytes -> turn_done, in that exact order.
+    # transcript -> thinking -> speaking -> PCM bytes -> turn_done, in that exact order.
     types = [f.get("type") if isinstance(f, dict) else "bytes" for f in sent]
-    assert types == ["transcript", "speaking", "bytes", "turn_done"]
+    assert types == ["transcript", "thinking", "speaking", "bytes", "turn_done"]
     assert sent[0] == {"type": "transcript", "text": "hello there."}
-    assert sent[2] == ("bytes", b"Hi back.")
+    assert sent[3] == ("bytes", b"Hi back.")
     # The turn was recorded in history (user + assistant).
     assert history == [
         {"role": "user", "content": "hello there."},
@@ -498,7 +498,7 @@ def test_drive_converse_turns_stop_word_ignored_in_continuous_mode(monkeypatch):
 
     types = [f.get("type") if isinstance(f, dict) else "bytes" for f in sent]
     assert "stop_word" not in types
-    assert types == ["transcript", "speaking", "bytes", "turn_done"]
+    assert types == ["transcript", "thinking", "speaking", "bytes", "turn_done"]
 
 
 def test_drive_converse_turns_caps_tts_output():

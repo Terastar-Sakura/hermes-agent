@@ -610,6 +610,10 @@ async def drive_converse_turns(
             await send_json({"type": "stop_word", "text": transcript})
             continue
 
+        # The agent turn (STT is already done → the model, which can be 5-50s to first token)
+        # now runs, then `speaking`. Tell the client we've moved past listening into processing
+        # so it can show "thinking" instead of looking stuck on "listening" for the whole wait.
+        await send_json({"type": "thinking"})
         # Suppress quiet accrual for the whole turn (agent think + speak): the user can't speak
         # into a reply, so those seconds must not count. end_turn (after turn_done) restarts the
         # quiet clock from zero so the first advisory lands a full quiet_interval later.

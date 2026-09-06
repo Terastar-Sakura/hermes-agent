@@ -44,6 +44,7 @@ Protocol:
            ``{"stop": true}`` to end, ``{"commit": true}`` to force endpoint
   server → ``{"type": "ready", "input": {...}, "output": {...}}``,
            ``{"type": "transcript", "text": ...}``,
+           ``{"type": "thinking"}`` while the agent turn runs (show "thinking", not "listening"),
            ``{"type": "speaking"}`` then binary PCM frames,
            ``{"type": "interrupted"}`` on barge-in,
            ``{"type": "turn_done", "expects_more": ?}`` after each reply (session mode sets
