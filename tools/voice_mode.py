@@ -1295,17 +1295,20 @@ def _vad_log(msg: str) -> None:
 
 
 def _capture_until_quiet(stream, np, block: int, pre_roll, *, endpoint_blocks: int,
-                         max_blocks: int, sample_rate: int = SAMPLE_RATE) -> str:
+                         max_blocks: int, sample_rate: int = SAMPLE_RATE,
+                         silence_rms: float = SILENCE_RMS_THRESHOLD) -> str:
     """After a trip, read until *endpoint_blocks* of quiet (or *max_blocks*) and write
     pre-roll + capture to a WAV at *sample_rate*. Playback was cut by the trigger, so silence
     endpointing works. *sample_rate* lets a network source that captured at a non-16 kHz rate
-    write a correctly-tagged WAV (Whisper resamples internally on transcription)."""
+    write a correctly-tagged WAV (Whisper resamples internally on transcription). *silence_rms*
+    is the end-of-utterance threshold: the caller can raise it above an absolute 200 so an
+    utterance ends when the level returns to a NOISY ambient floor (a TV) rather than never."""
     frames: List[Any] = list(pre_roll)
     quiet = 0
     for _ in range(max_blocks):
         data, _ = stream.read(block)
         frames.append(data.copy())
-        quiet = quiet + 1 if _rms(np, data) < SILENCE_RMS_THRESHOLD else 0
+        quiet = quiet + 1 if _rms(np, data) < silence_rms else 0
         if quiet >= endpoint_blocks:
             break
     return AudioRecorder._write_wav(np.concatenate(frames, axis=0), sample_rate=sample_rate)
@@ -1315,7 +1318,9 @@ class _BargeDetector:
     """Per-block barge-in state machine behind ``full_duplex_listen``."""
 
     def __init__(self, np, *, mult: float, calib_blocks: int, trip_blocks: int, grace_blocks: int,
-                 trip_fraction: float = 0.8) -> None:
+                 trip_fraction: float = 0.8, floor_percentile: float = 90.0,
+                 onset_mult: Optional[float] = None,
+                 onset_ceiling: Optional[float] = ONSET_TRIGGER_CEILING) -> None:
         self._np, self.mult, self.calib_blocks, self.grace_blocks = np, mult, calib_blocks, grace_blocks
         # Fraction of the recent window that must be above the trigger to trip. 0.8 (the CLI
         # barge default) demands a very sustained run, which quiet/choppy speech — whose
@@ -1324,6 +1329,16 @@ class _BargeDetector:
         # unchanged (sustained room noise trips at 0.8 too — it's the trigger + floor that
         # gate noise, not the window length).
         self.trip_needed = max(1, int(round(trip_blocks * trip_fraction)))
+        # Floor estimation + the onset (not-playing) trigger. Defaults keep the CLI behavior
+        # (pct90 floor, onset = quiet_floor*mult capped at ONSET_TRIGGER_CEILING). The converse
+        # loop opts into a SELF-CALIBRATING profile for noisy rooms (TV): a MEDIAN floor so a
+        # loud burst doesn't lock the floor high, a gentler onset multiplier, and NO ceiling —
+        # so in a loud room the trigger RISES with the floor above the noise instead of being
+        # pinned below it (which made a loud TV trip every block). The playback/barge trigger
+        # is unchanged (it still uses mult + PLAYBACK_MIN_TRIGGER + TRIGGER_CEILING).
+        self._floor_percentile = float(floor_percentile)
+        self._onset_mult = float(onset_mult) if onset_mult else float(mult)
+        self._onset_ceiling = onset_ceiling
         self.ambient: deque = deque(maxlen=100)  # ~3s of quiet-phase RMS
         self.recent_above: deque = deque(maxlen=trip_blocks)
         self.quiet_floor = float(SILENCE_RMS_THRESHOLD)
@@ -1332,13 +1347,16 @@ class _BargeDetector:
         self.blocks_since_playback = 10_000
 
     def _floor(self) -> tuple:
-        """(pct90, floor): 90th percentile of the quiet window, clamped to a small positive
-        ``MIN_QUIET_FLOOR`` (not the silence threshold). Clamping the floor UP to 200 assumed
-        every room's noise sits at ~200 RMS and multiplied the trigger out of reach of a
-        quiet / low-gain mic (whose room floor is genuinely 30-80); the trigger stays safe via
-        ONSET_TRIGGER_MIN + the sustained window, so the floor itself can track the real level."""
-        pct90 = float(self._np.percentile(list(self.ambient), 90)) if self.ambient else float(MIN_QUIET_FLOOR)
-        return pct90, max(pct90, float(MIN_QUIET_FLOOR))
+        """(pctile, floor): the configured percentile of the quiet window, clamped to a small
+        positive ``MIN_QUIET_FLOOR`` (not the silence threshold). pct90 (CLI default) tracks the
+        loud end of ambient; the converse loop uses the MEDIAN so a few loud TV blocks in the
+        window don't inflate the floor and pin the trigger high. Clamping to 200 assumed every
+        room's noise sits at ~200 RMS and pushed the trigger out of reach of a quiet mic; the
+        trigger stays safe via ONSET_TRIGGER_MIN + the sustained window, so the floor can track
+        the real level (30-80 quiet room, ~1500 with a TV on)."""
+        pctile = (float(self._np.percentile(list(self.ambient), self._floor_percentile))
+                  if self.ambient else float(MIN_QUIET_FLOOR))
+        return pctile, max(pctile, float(MIN_QUIET_FLOOR))
 
     def _calibrate(self, rms: float, playing: bool) -> bool:
         """Lock the floor from the first calib_blocks: the listener arms at utterance
@@ -1369,14 +1387,19 @@ class _BargeDetector:
         if not self.floor_locked and not self._calibrate(rms, playing):
             return None
         self._track_playback(playing)
-        # Trigger: quiet baseline x multiplier, phase-clamped. The ceiling is phase-dependent:
-        # during playback TRIGGER_CEILING keeps a noisy room from tripping on bleed; for the
-        # user's first word (not playing) the lower ONSET_TRIGGER_CEILING keeps detection
-        # sensitive even when the floor is elevated (AGC pumping), so normal speech still trips.
-        ceiling = TRIGGER_CEILING if playing else ONSET_TRIGGER_CEILING
-        trigger = max(self.quiet_floor * self.mult,
-                      PLAYBACK_MIN_TRIGGER if playing else ONSET_TRIGGER_MIN)
-        trigger = min(trigger, ceiling)
+        # Trigger: quiet baseline x multiplier, phase-dependent.
+        #  • Playback (barge-in): quiet_floor*mult, floored at PLAYBACK_MIN_TRIGGER and capped at
+        #    TRIGGER_CEILING so a noisy room never trips on speaker bleed.
+        #  • Onset (not playing): quiet_floor*onset_mult, floored at ONSET_TRIGGER_MIN and capped
+        #    at onset_ceiling IF one is set. The converse loop sets NO onset ceiling so the trigger
+        #    RISES with a loud floor (a TV) above the noise, instead of being pinned below it and
+        #    tripping every block.
+        if playing:
+            trigger = min(max(self.quiet_floor * self.mult, PLAYBACK_MIN_TRIGGER), TRIGGER_CEILING)
+        else:
+            trigger = max(self.quiet_floor * self._onset_mult, ONSET_TRIGGER_MIN)
+            if self._onset_ceiling is not None:
+                trigger = min(trigger, self._onset_ceiling)
         # Track ambient drift ONLY while nothing plays (never absorb bleed) and ONLY for blocks
         # near the quiet estimate. A block well above the floor is speech, not ambient — absorbing
         # it (the old `rms < trigger` gate did, once the trigger pinned at the ceiling) ratchets the

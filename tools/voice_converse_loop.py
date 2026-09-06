@@ -53,6 +53,16 @@ _SUSTAINED_MS = 300
 # Fraction of the sustained window that must be above the trigger to count as speech onset.
 # Lower than the CLI barge default (0.8) so soft speech with inter-syllable dips is still heard.
 _CONVERSE_TRIP_FRACTION = 0.6
+# Self-calibrating floor tuning (noisy rooms — e.g. a TV at the mic). MEDIAN floor tracks the
+# typical ambient without being inflated by loud bursts; onset trigger = floor * 1.5 (with no
+# ceiling) sits just above the ambient so a TV baseline doesn't trip but a louder voice does.
+_CONVERSE_FLOOR_PERCENTILE = 50.0
+_CONVERSE_ONSET_MULT = 1.5
+# Endpoint (end-of-utterance) silence threshold is floor-relative too: an utterance ends when
+# the level falls back toward the ambient floor, so it closes when the USER stops even if the
+# TV keeps going (the absolute 200 threshold never fired with a TV on). max() keeps the quiet-
+# room behavior (floor ~50 -> ~200, unchanged).
+_CONVERSE_ENDPOINT_FLOOR_MULT = 1.3
 _CALIBRATION_MS = 450
 _GRACE_MS = 500
 _PRE_ROLL_MS = 1200
@@ -220,6 +230,12 @@ class ConverseSession:
             # inter-syllable dips of soft speech, lowering the reliably-heard level to ~400-500
             # RMS without loosening noise rejection (the floor + trigger gate noise).
             trip_fraction=_CONVERSE_TRIP_FRACTION,
+            # Self-calibrating floor for noisy rooms (a TV at the mic): a MEDIAN floor so a loud
+            # burst doesn't lock the floor high, a gentle onset multiplier, and NO onset ceiling
+            # so the trigger rises with the floor above the noise instead of tripping every block.
+            floor_percentile=_CONVERSE_FLOOR_PERCENTILE,
+            onset_mult=_CONVERSE_ONSET_MULT,
+            onset_ceiling=None,
         )
         from collections import deque
 
@@ -357,10 +373,16 @@ class ConverseSession:
     def _capture_and_transcribe(self) -> str:
         """Endpoint the utterance from the pre-roll and return its transcript."""
         vm, np = self._vm, self._np
+        # End the utterance when the level falls back toward the ambient floor, not below an
+        # absolute 200 — so with a TV on (floor ~1500) the utterance closes when the USER stops
+        # instead of running to the 30 s cap and gluing the reply to the TV. Quiet rooms
+        # (floor ~50) keep the 200 threshold via max().
+        silence_rms = max(float(vm.SILENCE_RMS_THRESHOLD),
+                          self._detector.quiet_floor * _CONVERSE_ENDPOINT_FLOOR_MULT)
         wav_path = vm._capture_until_quiet(
             self.stream, np, self._block, self._pre_roll,
             endpoint_blocks=self._endpoint_blocks, max_blocks=self._max_blocks,
-            sample_rate=self._input_rate,
+            sample_rate=self._input_rate, silence_rms=silence_rms,
         )
         # _capture_until_quiet drained the pre-roll into the WAV; start fresh.
         self._pre_roll.clear()

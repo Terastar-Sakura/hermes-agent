@@ -73,6 +73,53 @@ class TestBoundaryIsDocumented:
         assert not heard(room_noise(250, seed=8), timeout=2.5), "250 RMS noise should be silent"
 
 
+class TestNoisyRoomSelfCalibrates:
+    """A loud ambient (a TV at the mic, ~1500 RMS) must not chatter: the floor calibrates to the
+    TV and the onset trigger rises above it, so the TV alone triggers nothing, but a louder voice
+    over it is still heard. Real ConverseSession; STT mocked."""
+
+    def _run(self, segments, *, timeout=4.0):
+        import queue as _queue
+
+        from tools.voice_converse_loop import ConverseSession
+        with mocked_stt("heard"):
+            session = ConverseSession(np, input_rate=16000)
+            session.start()
+            try:
+                for seg in segments:
+                    session.stream.feed(seg.tobytes())
+                got = []
+                try:
+                    while True:
+                        item = session.transcripts.get(timeout=timeout)
+                        if item is None:
+                            break
+                        if isinstance(item, str) and item:
+                            got.append(item)
+                            break
+                except _queue.Empty:
+                    pass
+                return got
+            finally:
+                session.stop()
+
+    def test_steady_tv_background_alone_does_not_chatter(self):
+        # ~3 s of steady TV-level noise (~1500 RMS), no voice → no turn. Before the self-
+        # calibrating floor, the trigger pinned below the TV and this tripped every block.
+        got = self._run([room_noise(1500, seconds=3.0, seed=5)], timeout=3.0)
+        assert got == [], f"TV background alone produced a spurious turn: {got}"
+
+    def test_voice_over_tv_is_heard(self):
+        # TV background, then a louder voice (~3000) over it → heard (the floor sits at the TV,
+        # the trigger just above it, the voice clears it).
+        segs = [
+            room_noise(1500, seconds=1.5, seed=6),
+            speech_like(3000, seconds=1.4, seed=7),
+            room_noise(1500, seconds=1.6, seed=8),
+        ]
+        assert self._run(segs, timeout=6.0) == ["heard"], "a voice over the TV should be heard"
+
+
 class TestQuietTracksReceivedSilence:
     """The quiet signal must track silence in the RECEIVED stream, not wall-clock — so a client
     that holds the socket open and streams only after a wake word never accrues phantom quiet
