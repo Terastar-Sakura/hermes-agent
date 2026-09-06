@@ -421,6 +421,40 @@ def test_drive_converse_turns_stop_word_ends_exchange(monkeypatch):
     assert getattr(session, "turns_begun", 0) == 0  # a stop-word does not begin a turn
 
 
+def test_voice_system_prompt_signoff_instruction():
+    from tools.voice_converse_loop import voice_system_prompt
+    # Session mode (allow_signoff) teaches the model the sign-off; continuous mode does not.
+    with_signoff = voice_system_prompt("Sakura", allow_signoff=True)
+    assert "Over and out" in with_signoff and "stops listening" in with_signoff
+    assert "Over and out" not in voice_system_prompt("Sakura", allow_signoff=False)
+
+
+def test_drive_converse_turns_agent_signoff_emits_conversation_end():
+    # Session mode: the agent ends its reply with the sign-off phrase → after turn_done the
+    # driver emits {"type":"conversation_end"} so a wake-word client sleeps immediately.
+    session = _FakeConverseSession(["are we done?"])
+    sent = _run_driver(session, [], ["All set. Over and out."], quiet_interval=1.0)
+    types = [f.get("type") if isinstance(f, dict) else "bytes" for f in sent]
+    assert "conversation_end" in types
+    assert types.index("conversation_end") > types.index("turn_done")  # after the reply plays
+
+
+def test_drive_converse_turns_signoff_ignored_in_continuous_mode():
+    # Continuous mode (quiet_interval=0): no session to end, so no conversation_end even if the
+    # reply happens to end with the phrase.
+    session = _FakeConverseSession(["are we done?"])
+    sent = _run_driver(session, [], ["All set. Over and out."], quiet_interval=0.0)
+    types = [f.get("type") if isinstance(f, dict) else "bytes" for f in sent]
+    assert "conversation_end" not in types
+
+
+def test_drive_converse_turns_normal_reply_no_conversation_end():
+    session = _FakeConverseSession(["what's the weather?"])
+    sent = _run_driver(session, [], ["It's sunny and 72."], quiet_interval=1.0)
+    types = [f.get("type") if isinstance(f, dict) else "bytes" for f in sent]
+    assert "conversation_end" not in types
+
+
 def test_drive_converse_turns_stop_word_ignored_in_continuous_mode(monkeypatch):
     # Continuous mode (quiet_interval=0): stop-word handling is off — "goodbye" is a
     # normal turn with no {"type":"stop_word"}.

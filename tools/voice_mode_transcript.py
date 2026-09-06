@@ -64,6 +64,36 @@ def is_voice_stop_phrase(transcript: str, stop_phrases: Optional[tuple] = None) 
     return bool(cleaned) and cleaned in (_load_voice_stop_phrases() if stop_phrases is None else stop_phrases)
 
 
+# The assistant's own sign-off: a spoken phrase the model puts at the END of a reply to declare
+# the conversation complete, so a session-mode client stops listening (goes back to the wake
+# word) without waiting for the VAD to detect silence — which a noisy room (a TV) never does.
+DEFAULT_VOICE_END_PHRASES = ("over and out",)
+
+
+def _load_voice_end_phrases() -> tuple:
+    """Configured ``voice.end_phrases`` (default ``("over and out",)``); an empty tuple disables
+    the feature. Malformed config falls back to the default rather than crashing the voice loop."""
+    with suppress(Exception):
+        raw = _voice_config().get("end_phrases", DEFAULT_VOICE_END_PHRASES)
+        if isinstance(raw, str):
+            raw = [raw]
+        if isinstance(raw, (list, tuple)):
+            return tuple(str(p).strip().lower() for p in raw if isinstance(p, (str, int, float)) and str(p).strip())
+    return DEFAULT_VOICE_END_PHRASES
+
+
+def is_voice_end_phrase(reply: str, end_phrases: Optional[tuple] = None) -> bool:
+    """True when the assistant's *reply* ENDS with a sign-off phrase (e.g. "over and out"). Unlike
+    a stop phrase this is a TRAILING match — the model naturally speaks it as the last thing in a
+    reply ("…lights are on. Over and out.") — lowercased with trailing punctuation stripped.
+    ``voice.end_phrases: []`` disables."""
+    cleaned = reply.strip().lower().rstrip(".,!?;: \t\n\"'") if reply else ""
+    if not cleaned:
+        return False
+    phrases = _load_voice_end_phrases() if end_phrases is None else end_phrases
+    return any(cleaned.endswith(p) for p in phrases if p)
+
+
 # Similarity ratio (difflib.SequenceMatcher) above which a playback-phase barge transcript
 # is treated as a self-capture of Hermes' own TTS: the full-duplex listener has no echo
 # cancellation, so speaker bleed can be transcribed near-verbatim (TTS -> STT -> TTS loop).

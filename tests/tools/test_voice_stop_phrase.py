@@ -14,8 +14,10 @@ from unittest.mock import patch
 import pytest
 
 from tools.voice_mode_transcript import (
+    DEFAULT_VOICE_END_PHRASES,
     DEFAULT_VOICE_STOP_PHRASES,
     _load_voice_stop_phrases,
+    is_voice_end_phrase,
     is_voice_stop_phrase,
     voice_stop_hint,
 )
@@ -66,6 +68,30 @@ class TestCancelIsADefaultStopPhrase:
     def test_cancel_inside_a_sentence_is_not_a_stop(self):
         # Whole-utterance match only: a real request that merely contains "cancel" reaches the agent.
         assert is_voice_stop_phrase("cancel my 3pm meeting", DEFAULT_VOICE_STOP_PHRASES) is False
+
+
+class TestIsVoiceEndPhrase:
+    """The assistant's sign-off: the model's reply ENDS with an end phrase to close the session."""
+
+    def test_default_is_over_and_out(self):
+        assert DEFAULT_VOICE_END_PHRASES == ("over and out",)
+
+    @pytest.mark.parametrize("reply", [
+        "Over and out.", "over and out", "OVER AND OUT!",
+        "Your lights are on. Over and out.", "Done — over and out.",
+    ])
+    def test_reply_ending_with_signoff_matches(self, reply):
+        assert is_voice_end_phrase(reply, DEFAULT_VOICE_END_PHRASES) is True
+
+    @pytest.mark.parametrize("reply", [
+        "It's 72 degrees out.", "Over and out is a phrase pilots use.",  # only a TRAILING match ends
+        "", "   ",
+    ])
+    def test_non_signoff_reply_does_not_match(self, reply):
+        assert is_voice_end_phrase(reply, DEFAULT_VOICE_END_PHRASES) is False
+
+    def test_disabled_when_no_end_phrases(self):
+        assert is_voice_end_phrase("Over and out.", ()) is False
 
 
 class TestLoadVoiceStopPhrases:

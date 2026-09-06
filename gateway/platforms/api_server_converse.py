@@ -47,6 +47,7 @@ Protocol:
            ``{"type": "speaking"}`` then binary PCM frames,
            ``{"type": "interrupted"}`` on barge-in,
            ``{"type": "turn_done"}`` after each reply,
+           ``{"type": "conversation_end"}`` when the agent signed off (session mode),
            ``{"type": "error", "error": ...}`` on failure.
 """
 
@@ -311,7 +312,7 @@ async def _handle_converse_ws(self, request: "web.Request") -> "web.WebSocketRes
         from tools.voice_converse_loop import voice_system_prompt
         result, _usage = await self._run_agent(
             user_message=transcript, conversation_history=list(conversation_history),
-            ephemeral_system_prompt=voice_system_prompt(name),
+            ephemeral_system_prompt=voice_system_prompt(name, allow_signoff=quiet_interval > 0),
             stream_delta_callback=on_delta, session_id=session_id)
         if isinstance(result, dict) and result.get("failed"):
             return "", str(result.get("error") or "agent run failed")

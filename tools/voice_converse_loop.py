@@ -482,22 +482,37 @@ _VOICE_BREVITY_PROMPT = (
 )
 
 
-def voice_system_prompt(name: Optional[str] = None) -> str:
+def voice_system_prompt(name: Optional[str] = None, *, allow_signoff: bool = False) -> str:
     """Ephemeral system prompt for one converse turn.
 
     When *name* is given, prepend an identity + wake-word preamble (so the model knows what
     it's called and treats a leading name / "hey <name>" as being addressed, not part of the
     request) before the spoken-brevity rules. When *name* is ``None``/empty, just the brevity
     rules. The default converse name is ``"Sakura"``, so most turns carry the identity block.
+
+    When *allow_signoff* (session/wake mode), append a sign-off instruction: the model can end
+    the conversation by finishing its reply with the configured end phrase (default "Over and
+    out."), which the server turns into a ``conversation_end`` frame so a wake-word client stops
+    listening — the agent's own way to end the exchange, robust to a noisy room the VAD can't
+    endpoint.
     """
     name = (str(name).strip() if name is not None else "")
+    prompt = _VOICE_BREVITY_PROMPT
     if name:
-        identity = (
+        prompt = (
             f"Your name is {name}. People talk to you by voice and get your attention by saying "
             f"your name (or 'hey {name}') — treat that as being addressed, not part of the "
-            "request, and don't repeat it back. ")
-        return identity + _VOICE_BREVITY_PROMPT
-    return _VOICE_BREVITY_PROMPT
+            "request, and don't repeat it back. ") + prompt
+    if allow_signoff:
+        from tools.voice_mode_transcript import _load_voice_end_phrases
+        phrases = _load_voice_end_phrases()
+        if phrases:
+            who = name or "the assistant"
+            prompt += (
+                f" When the exchange is complete and you don't expect the user to follow up, end "
+                f"your reply with '{phrases[0].capitalize()}.' — that closes the conversation so "
+                f"{who} stops listening. Use it only when truly done, never mid-task.")
+    return prompt
 # Safety cap on how much of ONE reply is ever synthesized to speech, so a runaway reply (a
 # model ignoring the brevity prompt, or a tool result read aloud) can't play for minutes.
 # Normal replies sit far under this; it only bounds the pathological case.
@@ -569,7 +584,7 @@ async def drive_converse_turns(
     """
     from tools.tts_streaming import SentenceChunker
     from tools.tts_text_normalize import _strip_markdown_for_tts
-    from tools.voice_mode_transcript import is_voice_stop_phrase
+    from tools.voice_mode_transcript import is_voice_end_phrase, is_voice_stop_phrase
 
     while not session.stopped:
         # Block for the next event on the session queue: a transcript (str), an QuietTick
@@ -743,6 +758,11 @@ async def drive_converse_turns(
         await send_json({"type": "turn_done"})
         # Reply done: resume the quiet clock from zero (a full quiet_interval window follows).
         session.end_turn()
+        # Agent-driven end: if the model signed off ("… Over and out.") in session mode, tell the
+        # client the conversation is over so a wake-word client sleeps immediately — no waiting on
+        # the VAD to detect silence (which a noisy room never does).
+        if quiet_interval > 0 and is_voice_end_phrase(reply):
+            await send_json({"type": "conversation_end"})
 
 
 # ── converse synthesizer: one uniform "text -> int16 PCM" seam for both paths ──
