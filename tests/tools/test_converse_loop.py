@@ -442,6 +442,28 @@ def test_drive_converse_turns_signoff_sets_expects_more_false():
     assert not any(isinstance(f, dict) and f.get("type") == "conversation_end" for f in sent)
 
 
+def _spoken_bytes(sent):
+    return b"".join(f[1] for f in sent if isinstance(f, tuple) and f[0] == "bytes")
+
+
+def test_drive_converse_turns_signoff_is_not_spoken_but_still_flags():
+    # Session mode: the sign-off is a control marker — stripped from the spoken audio (the
+    # _EchoSynth echoes the TTS text as bytes) while still setting expects_more=false.
+    session = _FakeConverseSession(["bye"])
+    sent = _run_driver(session, [], ["See you later. Over and out."], quiet_interval=1.0)
+    spoken = _spoken_bytes(sent).lower()
+    assert b"see you later" in spoken
+    assert b"over and out" not in spoken  # not spoken aloud
+    assert _turn_done_frame(sent).get("expects_more") is False
+
+
+def test_drive_converse_turns_signoff_spoken_in_continuous_mode():
+    # Continuous mode: no sign-off handling, so the phrase is spoken normally (not a marker).
+    session = _FakeConverseSession(["bye"])
+    sent = _run_driver(session, [], ["See you later. Over and out."], quiet_interval=0.0)
+    assert b"over and out" in _spoken_bytes(sent).lower()
+
+
 def test_drive_converse_turns_question_sets_expects_more_true():
     # Session mode: the agent asked a follow-up question → turn_done carries expects_more=true
     # so the client keeps the mic hot instead of sleeping on the next quiet.

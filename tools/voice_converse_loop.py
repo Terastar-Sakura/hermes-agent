@@ -584,7 +584,8 @@ async def drive_converse_turns(
     """
     from tools.tts_streaming import SentenceChunker
     from tools.tts_text_normalize import _strip_markdown_for_tts
-    from tools.voice_mode_transcript import is_voice_end_phrase, is_voice_stop_phrase
+    from tools.voice_mode_transcript import (
+        is_voice_end_phrase, is_voice_stop_phrase, strip_voice_end_phrase)
 
     while not session.stopped:
         # Block for the next event on the session queue: a transcript (str), an QuietTick
@@ -680,6 +681,11 @@ async def drive_converse_turns(
             try:
                 for sentence in _sentences():
                     cleaned = _strip_markdown_for_tts(sentence)
+                    # The sign-off phrase is a control marker, not something to say aloud: in
+                    # session mode, strip a trailing end phrase before TTS so the conversation
+                    # ends silently (the full reply still sets turn_done.expects_more=false).
+                    if quiet_interval > 0:
+                        cleaned = strip_voice_end_phrase(cleaned)
                     if not cleaned:
                         continue
                     _timing.setdefault("first_sentence", time.monotonic())

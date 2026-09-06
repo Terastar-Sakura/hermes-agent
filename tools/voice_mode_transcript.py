@@ -94,6 +94,26 @@ def is_voice_end_phrase(reply: str, end_phrases: Optional[tuple] = None) -> bool
     return any(cleaned.endswith(p) for p in phrases if p)
 
 
+def strip_voice_end_phrase(text: str, end_phrases: Optional[tuple] = None) -> str:
+    """Remove a TRAILING sign-off phrase (with its adjacent punctuation) from *text* so it is used
+    only as an end-of-conversation SIGNAL, not spoken aloud. "Give me a shout. Over and out." ->
+    "Give me a shout." Returns *text* unchanged when it doesn't end with a phrase (so mid-text
+    mentions are untouched). Applied to the TTS text only; the full reply still drives detection."""
+    if not text:
+        return text
+    phrases = _load_voice_end_phrases() if end_phrases is None else end_phrases
+    for p in phrases:
+        if not p:
+            continue
+        # Leading class strips only the separator before the phrase (whitespace, comma, dash) —
+        # NOT a period, which terminates the previous sentence and must be kept ("shout. Over
+        # and out." -> "shout.").
+        m = re.search(r"[\s\-—,;:]*" + re.escape(p) + r"[\s.!?,]*$", text, flags=re.IGNORECASE)
+        if m:
+            return text[:m.start()].rstrip()
+    return text
+
+
 # Similarity ratio (difflib.SequenceMatcher) above which a playback-phase barge transcript
 # is treated as a self-capture of Hermes' own TTS: the full-duplex listener has no echo
 # cancellation, so speaker bleed can be transcribed near-verbatim (TTS -> STT -> TTS loop).

@@ -19,6 +19,7 @@ from tools.voice_mode_transcript import (
     _load_voice_stop_phrases,
     is_voice_end_phrase,
     is_voice_stop_phrase,
+    strip_voice_end_phrase,
     voice_stop_hint,
 )
 
@@ -92,6 +93,27 @@ class TestIsVoiceEndPhrase:
 
     def test_disabled_when_no_end_phrases(self):
         assert is_voice_end_phrase("Over and out.", ()) is False
+
+
+class TestStripVoiceEndPhrase:
+    """The sign-off is a control marker, not speech: it's stripped from the TTS text."""
+
+    @pytest.mark.parametrize("reply,spoken", [
+        ("Give me a shout. Over and out.", "Give me a shout."),
+        ("All done — over and out!", "All done"),
+        ("Over and out.", ""),
+        ("Talk soon, over and out", "Talk soon"),
+    ])
+    def test_trailing_signoff_is_removed(self, reply, spoken):
+        assert strip_voice_end_phrase(reply, DEFAULT_VOICE_END_PHRASES) == spoken
+
+    def test_non_trailing_mention_is_untouched(self):
+        # "over and out" only in the middle → left alone (only a TRAILING sign-off is a marker).
+        text = "Over and out is radio slang for goodbye."
+        assert strip_voice_end_phrase(text, DEFAULT_VOICE_END_PHRASES) == text
+
+    def test_plain_reply_untouched(self):
+        assert strip_voice_end_phrase("It's sunny and 72.", DEFAULT_VOICE_END_PHRASES) == "It's sunny and 72."
 
 
 class TestLoadVoiceStopPhrases:
