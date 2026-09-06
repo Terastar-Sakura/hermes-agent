@@ -46,8 +46,9 @@ Protocol:
            ``{"type": "transcript", "text": ...}``,
            ``{"type": "speaking"}`` then binary PCM frames,
            ``{"type": "interrupted"}`` on barge-in,
-           ``{"type": "turn_done"}`` after each reply,
-           ``{"type": "conversation_end"}`` when the agent signed off (session mode),
+           ``{"type": "turn_done", "expects_more": ?}`` after each reply (session mode sets
+             expects_more=false when the agent signed off → sleep, true on a trailing question
+             → keep listening; absent otherwise),
            ``{"type": "error", "error": ...}`` on failure.
 """
 

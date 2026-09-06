@@ -429,30 +429,41 @@ def test_voice_system_prompt_signoff_instruction():
     assert "Over and out" not in voice_system_prompt("Sakura", allow_signoff=False)
 
 
-def test_drive_converse_turns_agent_signoff_emits_conversation_end():
-    # Session mode: the agent ends its reply with the sign-off phrase → after turn_done the
-    # driver emits {"type":"conversation_end"} so a wake-word client sleeps immediately.
+def _turn_done_frame(sent):
+    return next(f for f in sent if isinstance(f, dict) and f.get("type") == "turn_done")
+
+
+def test_drive_converse_turns_signoff_sets_expects_more_false():
+    # Session mode: the agent ends its reply with the sign-off phrase → turn_done carries
+    # expects_more=false so a wake-word client sleeps immediately. No separate frame.
     session = _FakeConverseSession(["are we done?"])
     sent = _run_driver(session, [], ["All set. Over and out."], quiet_interval=1.0)
-    types = [f.get("type") if isinstance(f, dict) else "bytes" for f in sent]
-    assert "conversation_end" in types
-    assert types.index("conversation_end") > types.index("turn_done")  # after the reply plays
+    assert _turn_done_frame(sent).get("expects_more") is False
+    assert not any(isinstance(f, dict) and f.get("type") == "conversation_end" for f in sent)
 
 
-def test_drive_converse_turns_signoff_ignored_in_continuous_mode():
-    # Continuous mode (quiet_interval=0): no session to end, so no conversation_end even if the
-    # reply happens to end with the phrase.
-    session = _FakeConverseSession(["are we done?"])
-    sent = _run_driver(session, [], ["All set. Over and out."], quiet_interval=0.0)
-    types = [f.get("type") if isinstance(f, dict) else "bytes" for f in sent]
-    assert "conversation_end" not in types
+def test_drive_converse_turns_question_sets_expects_more_true():
+    # Session mode: the agent asked a follow-up question → turn_done carries expects_more=true
+    # so the client keeps the mic hot instead of sleeping on the next quiet.
+    session = _FakeConverseSession(["set a timer"])
+    sent = _run_driver(session, [], ["Sure — for how long?"], quiet_interval=1.0)
+    assert _turn_done_frame(sent).get("expects_more") is True
 
 
-def test_drive_converse_turns_normal_reply_no_conversation_end():
+def test_drive_converse_turns_plain_reply_has_no_expects_more():
+    # A plain statement gives no signal: the field is ABSENT (client's quiet timer governs).
     session = _FakeConverseSession(["what's the weather?"])
     sent = _run_driver(session, [], ["It's sunny and 72."], quiet_interval=1.0)
-    types = [f.get("type") if isinstance(f, dict) else "bytes" for f in sent]
-    assert "conversation_end" not in types
+    assert "expects_more" not in _turn_done_frame(sent)
+
+
+def test_drive_converse_turns_continuous_mode_never_sets_expects_more():
+    # Continuous mode (quiet_interval=0): the flag is meaningless, so it's never set, even for a
+    # sign-off or a question.
+    for reply in ("All set. Over and out.", "For how long?"):
+        session = _FakeConverseSession(["hi"])
+        sent = _run_driver(session, [], [reply], quiet_interval=0.0)
+        assert "expects_more" not in _turn_done_frame(sent)
 
 
 def test_drive_converse_turns_stop_word_ignored_in_continuous_mode(monkeypatch):

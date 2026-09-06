@@ -492,9 +492,9 @@ def voice_system_prompt(name: Optional[str] = None, *, allow_signoff: bool = Fal
 
     When *allow_signoff* (session/wake mode), append a sign-off instruction: the model can end
     the conversation by finishing its reply with the configured end phrase (default "Over and
-    out."), which the server turns into a ``conversation_end`` frame so a wake-word client stops
-    listening — the agent's own way to end the exchange, robust to a noisy room the VAD can't
-    endpoint.
+    out."), which the server reports as ``turn_done.expects_more = false`` so a wake-word client
+    stops listening — the agent's own way to end the exchange, robust to a noisy room the VAD
+    can't endpoint.
     """
     name = (str(name).strip() if name is not None else "")
     prompt = _VOICE_BREVITY_PROMPT
@@ -755,14 +755,22 @@ async def drive_converse_turns(
             await send_json({"type": "interrupted"})
         elif turn_result.get("err"):
             await send_json({"type": "error", "error": turn_result["err"]})
-        await send_json({"type": "turn_done"})
+        # turn_done carries the agent's follow-up expectation in session mode, so a wake-word
+        # client knows what to do without waiting on the VAD (which a noisy room never
+        # endpoints): expects_more=false when the model signed off ("… Over and out." → the
+        # conversation is over, sleep now), expects_more=true when it asked a question (a
+        # follow-up is coming → keep the mic hot, don't sleep on the next quiet), and the field
+        # is ABSENT otherwise (no signal → the client's quiet timer governs). Absent must read as
+        # "keep listening", so a client ignoring the field never sleeps unexpectedly.
+        turn_done: Dict[str, Any] = {"type": "turn_done"}
+        if quiet_interval > 0:
+            if is_voice_end_phrase(reply):
+                turn_done["expects_more"] = False
+            elif reply.rstrip().endswith("?"):
+                turn_done["expects_more"] = True
+        await send_json(turn_done)
         # Reply done: resume the quiet clock from zero (a full quiet_interval window follows).
         session.end_turn()
-        # Agent-driven end: if the model signed off ("… Over and out.") in session mode, tell the
-        # client the conversation is over so a wake-word client sleeps immediately — no waiting on
-        # the VAD to detect silence (which a noisy room never does).
-        if quiet_interval > 0 and is_voice_end_phrase(reply):
-            await send_json({"type": "conversation_end"})
 
 
 # ── converse synthesizer: one uniform "text -> int16 PCM" seam for both paths ──
